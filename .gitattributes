@@ -1,0 +1,12 @@
+* text=auto eol=lf
+
+# Image fixtures — explicitly binary so git doesn't try to diff or normalise them
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.tif  binary
+*.tiff binary
+*.webp binary
+*.ico  binary
+*.bmp  binary
+*.gif  binary
