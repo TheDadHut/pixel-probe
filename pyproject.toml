@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "setuptools-scm>=8"]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,8 @@ name = "pixel-probe"
 dynamic = ["version"]
 description = "Desktop image-analysis tool for inspecting EXIF, IPTC, and XMP metadata."
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "TheDadHut" }]
 keywords = ["image", "metadata", "exif", "iptc", "xmp", "desktop", "qt", "pyside6"]
@@ -15,7 +16,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -52,6 +52,11 @@ docs = [
 [project.scripts]
 pixel-probe = "pixel_probe.cli:main"
 # pixel-probe-gui entry point lands in Phase 5 alongside main_window.py
+
+[project.urls]
+Homepage   = "https://github.com/TheDadHut/pixel-probe"
+Repository = "https://github.com/TheDadHut/pixel-probe"
+Issues     = "https://github.com/TheDadHut/pixel-probe/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -142,5 +147,4 @@ enable_error_code = [
     "redundant-expr",       # always-true/always-false expressions
     "truthy-bool",          # boolean checks on non-bool values
     "ignore-without-code",  # forces `# type: ignore[specific-error]` not bare `# type: ignore`
-    "unused-awaitable",     # async results not awaited
 ]

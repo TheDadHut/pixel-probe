@@ -10,8 +10,11 @@ import sys
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Stub CLI. Phase 4 replaces this with argparse + extractor wiring."""
-    del argv  # unused until PR 4
+    """Stub CLI. Phase 4 replaces this with argparse + extractor wiring.
+
+    The ``argv`` parameter shape is the documented future API — Phase 4 will use it
+    to make the CLI testable via subprocess-free in-process invocation.
+    """
     print("pixel-probe CLI is not yet implemented. See PLAN.md PR 4.")
     return 0
 

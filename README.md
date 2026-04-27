@@ -33,7 +33,7 @@ src/pixel_probe/
 
 Two parallel package families: **`extractors/`** read embedded bytes (EXIF, IPTC, XMP, file metadata — fast, can be empty); future **`analyzers/`** compute from pixels (histogram, dominant colours — slower, always produce output). They share an `Extractor[T]` ABC but live in separate packages because they have genuinely different perf profiles and failure modes.
 
-Architectural decisions are documented as ADRs in [`docs/adr/`](docs/adr/).
+Architectural decisions land as ADRs in `docs/adr/` (PR 0b).
 
 ## Install
 
