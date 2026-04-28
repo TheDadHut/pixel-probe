@@ -31,6 +31,10 @@ jobs:
   test:
     name: Test (Python ${{ matrix.python-version }} / ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      checks: write          # publish-unit-test-result-action creates check runs
+      pull-requests: write   # ...and posts a PR comment with results
     strategy:
       fail-fast: false
       matrix:
