@@ -27,3 +27,11 @@ updates:
     labels:
       - dependencies
       - ci
+    groups:
+      # Same pattern as Python deps: bundle minor/patch into one weekly PR.
+      # Major bumps (e.g. checkout@v3 → v4) often have breaking changes
+      # and stay as individual PRs that need review.
+      github-actions:
+        update-types:
+          - minor
+          - patch

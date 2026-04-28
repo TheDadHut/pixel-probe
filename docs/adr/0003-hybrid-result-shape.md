@@ -30,7 +30,7 @@ class ExtractorResult(Generic[T]):
 `T` is the per-extractor payload type:
 
 - `FileInfoExtractor(Extractor[FileInfo])` — concrete dataclass for the small, stable schema
-- `ExifExtractor(Extractor[ExifData])` where `ExifData = dict[str, Any]` — module-level type alias for readability (see ADR 0001 reasoning carried into B6)
+- `ExifExtractor(Extractor[ExifData])` where `ExifData = dict[str, Any]` — module-level type alias keeps signatures from drowning in `dict[str, Any]` repetitions and lets us tighten the alias later (e.g. to a `TypedDict`) without rippling to every callsite
 - `IptcExtractor(Extractor[IptcData])` where `IptcData = dict[str, str | list[str]]`
 - `XmpExtractor(Extractor[XmpData])` where `XmpData = dict[str, dict[str, Any]]`
 
