@@ -1,0 +1,150 @@
+[build-system]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pixel-probe"
+dynamic = ["version"]
+description = "Desktop image-analysis tool for inspecting EXIF, IPTC, and XMP metadata."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "TheDadHut" }]
+keywords = ["image", "metadata", "exif", "iptc", "xmp", "desktop", "qt", "pyside6"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "Pillow>=10.0",
+    "defusedxml>=0.7",
+    "PySide6>=6.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-qt>=4",
+    "pytest-cov>=5",
+    "hypothesis>=6",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "pre-commit>=3.7",
+]
+docs = [
+    "sphinx>=7",
+    "furo>=2024.0",
+    "myst-parser>=3",
+    "sphinx-autodoc-typehints>=2",
+]
+
+[project.scripts]
+pixel-probe = "pixel_probe.cli:main"
+# pixel-probe-gui entry point lands in Phase 5 alongside main_window.py
+
+[project.urls]
+Homepage   = "https://github.com/TheDadHut/pixel-probe"
+Repository = "https://github.com/TheDadHut/pixel-probe"
+Issues     = "https://github.com/TheDadHut/pixel-probe/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"pixel_probe" = ["py.typed"]
+
+# setuptools-scm derives the version from the latest git tag; no __version__ string
+# anywhere in source. importlib.metadata.version("pixel-probe") reads it back at runtime.
+[tool.setuptools_scm]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+qt_api = "pyside6"
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: tests that touch real fixture files",
+    "e2e: end-to-end CLI tests via subprocess",
+    "gui: tests that require a Qt event loop (pytest-qt)",
+    "property: Hypothesis-driven property tests",
+    "security: adversarial-input parser tests",
+    "slow: tests that take > 1 second",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# 18 rule categories chosen for what they actually catch in this codebase.
+# Categories considered and rejected (see PLAN.md §1.D1 for full reasoning):
+#   PIE, ERA — mostly cosmetic / flag legitimate "alternative approach" comments
+#   PTH      — we already use pathlib everywhere; rule enforces what we already do
+#   SLF      — low signal-to-noise on private-access detection
+#   FBT      — boolean-trap rule fights legitimate APIs more than it helps
+#   ARG      — noisy with abstract methods and pytest fixtures
+#   PLR      — opinionated refactor rules (magic-values, too-many-args) fight binary parsers
+#   TRY      — tryceratops is opinionated; TRY003 (long messages) was the worst offender
+select = [
+    # Core (every project should have these)
+    "E", "W", "F",   # pycodestyle + pyflakes
+    "I",             # isort — import ordering
+    "UP",            # pyupgrade — modern Python idioms
+    "B",             # bugbear — likely-bug patterns
+    "RUF",           # ruff-specific catches no other tool does
+
+    # Quality / clarity
+    "SIM",           # simplify — redundant constructs
+    "C4",            # comprehensions — idiomatic forms
+    "RET",           # return statement clarity
+    "PERF",          # perflint — performance anti-patterns
+    "PLW", "PLE",    # pylint warning + error subsets (skip the opinionated PLR refactors)
+    "BLE",           # blind-except — flag broad except: clauses; orchestrator's deliberate one is waived via `# noqa: BLE001`
+
+    # Conventions
+    "N",             # PEP 8 naming
+    "A",             # builtins shadowing
+    "DTZ",           # timezone-aware datetimes (we use tz=UTC)
+    "T20",           # no print() in library code
+
+    # Domain-specific
+    "S",             # bandit — security rules; relevant for binary parsing
+    "PT",            # pytest style — idiomatic test code
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py"          = ["S101"]   # asserts are required in tests
+"src/pixel_probe/cli.py" = ["T201"]   # CLI legitimately prints
+"scripts/**/*.py"        = ["T201"]   # build scripts legitimately print
+
+[tool.ruff.lint.isort]
+known-first-party = ["pixel_probe"]
+
+[tool.ruff.lint.flake8-pytest-style]
+fixture-parentheses    = false
+mark-parentheses       = false
+parametrize-names-type = "tuple"
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+packages = ["pixel_probe"]
+strict = true
+warn_unreachable = true
+enable_error_code = [
+    "redundant-self",       # `self.foo = self.foo` and similar
+    "redundant-expr",       # always-true/always-false expressions
+    "truthy-bool",          # boolean checks on non-bool values
+    "ignore-without-code",  # forces `# type: ignore[specific-error]` not bare `# type: ignore`
+]
