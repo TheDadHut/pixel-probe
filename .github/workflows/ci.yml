@@ -32,9 +32,7 @@ jobs:
     name: Test (Python ${{ matrix.python-version }} / ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: read
-      checks: write          # publish-unit-test-result-action creates check runs
-      pull-requests: write   # ...and posts a PR comment with results
+      contents: read   # only read; the publisher runs in `report` (downstream)
     strategy:
       fail-fast: false
       matrix:
@@ -91,16 +89,36 @@ jobs:
           path: junit.xml
           retention-days: 14
 
-      - name: Publish test results
-        if: always() && matrix.os == 'ubuntu-latest'
-        uses: EnricoMi/publish-unit-test-result-action@v2
-        with:
-          files: junit.xml
-          check_name: Test results (Python ${{ matrix.python-version }})
-
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.14' && matrix.os == 'ubuntu-latest'
         uses: codecov/codecov-action@v4
         with:
           files: coverage.xml
           fail_ci_if_error: false
+
+  # Aggregate JUnit XML from every matrix cell into a single PR comment +
+  # check run. This pattern (matrix → fan-in publish job) means a Windows-only
+  # failure surfaces in the same place as a Linux-only failure, instead of
+  # each matrix cell publishing its own check.
+  report:
+    name: Publish test results
+    runs-on: ubuntu-latest
+    needs: test
+    if: always()   # publish even when test job fails — that's exactly when we want a comment
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    steps:
+      - name: Download all JUnit artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: junit-*
+      - name: Publish unified test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          files: |
+            artifacts/junit-*/junit.xml
+          check_name: Test results
+          comment_title: Test results
