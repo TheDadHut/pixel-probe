@@ -21,7 +21,13 @@ repos:
     rev: v1.11.2
     hooks:
       - id: mypy
+        # Match `make lint` and CI: `mypy src` reads the config
+        # (packages = ["pixel_probe"]) and ignores tests/scripts.
+        # pass_filenames: false → we don't pass per-file paths, so mypy doesn't
+        # try to check test files against an env without pytest/Pillow stubs.
+        pass_filenames: false
+        args: [--config-file=pyproject.toml, src]
         additional_dependencies:
+          - Pillow
           - PySide6
           - types-defusedxml
-        args: [--config-file=pyproject.toml]
