@@ -13,6 +13,7 @@ __all__ = [
     "CorruptMetadataError",
     "DecompressionBombError",
     "FileTooLargeError",
+    "MissingFileError",
     "PixelProbeError",
     "UnsupportedFormatError",
 ]
@@ -20,6 +21,14 @@ __all__ = [
 
 class PixelProbeError(Exception):
     """Base class for all pixel-probe errors."""
+
+
+class MissingFileError(PixelProbeError):
+    """Raised when an extractor's input path doesn't exist or isn't a regular file.
+
+    Kept inside the :class:`PixelProbeError` hierarchy so a single
+    ``except PixelProbeError`` clause catches all extractor-side failures.
+    """
 
 
 class UnsupportedFormatError(PixelProbeError):

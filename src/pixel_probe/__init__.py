@@ -8,6 +8,7 @@ from .exceptions import (
     CorruptMetadataError,
     DecompressionBombError,
     FileTooLargeError,
+    MissingFileError,
     PixelProbeError,
     UnsupportedFormatError,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "FileInfo",
     "FileInfoExtractor",
     "FileTooLargeError",
+    "MissingFileError",
     "PixelProbeError",
     "UnsupportedFormatError",
     "__version__",

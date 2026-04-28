@@ -19,6 +19,7 @@ required for Pillow's module-level ``MAX_IMAGE_PIXELS``.
 
 from __future__ import annotations
 
+import threading
 import warnings
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,7 +29,7 @@ from typing import Final
 
 from PIL import Image, UnidentifiedImageError
 
-from pixel_probe.exceptions import DecompressionBombError, FileTooLargeError
+from pixel_probe.exceptions import DecompressionBombError, FileTooLargeError, MissingFileError
 
 from .base import Extractor, ExtractorResult
 
@@ -38,6 +39,14 @@ __all__ = [
     "FileInfo",
     "FileInfoExtractor",
 ]
+
+# ``Image.MAX_IMAGE_PIXELS`` is process-global; the save/restore dance below
+# is not thread-safe on its own. This lock serializes overlapping ``extract``
+# calls so a concurrent caller can't observe (or worse, restore) a stale
+# previous-value. Sequential v0.1 doesn't strictly need this, but the GUI
+# worker (Phase 5) calls ``analyze`` from a background thread — a second
+# request kicked off before the first finishes would race without the lock.
+_PILLOW_MAX_PIXELS_LOCK = threading.Lock()
 
 #: Refuse to read files larger than this. 500 MB covers any reasonable photo;
 #: anything bigger is almost certainly a bomb or wrong file type.
@@ -80,7 +89,7 @@ class FileInfoExtractor(Extractor[FileInfo]):
 
     def extract(self, path: Path) -> ExtractorResult[FileInfo]:
         if not path.is_file():
-            raise FileNotFoundError(path)
+            raise MissingFileError(f"Not a file: {path}")
 
         stat = path.stat()
         if stat.st_size > MAX_FILE_SIZE_BYTES:
@@ -89,6 +98,9 @@ class FileInfoExtractor(Extractor[FileInfo]):
             )
 
         warning_messages: list[str] = []
+        # SHA-256 is computed before the image-format check because we want to
+        # populate the file-level fields (size, hash, mtime) for non-image inputs
+        # too — only the image-specific fields go ``None`` in that case.
         digest = self._sha256(path)
         mtime_iso = datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()
 
@@ -97,26 +109,27 @@ class FileInfoExtractor(Extractor[FileInfo]):
         width: int | None = None
         height: int | None = None
 
-        # Save/restore Pillow's module-level threshold so other code in the
-        # process isn't affected by our tighter limit.
-        previous_max = Image.MAX_IMAGE_PIXELS
-        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-        try:
-            # Pillow only RAISES DecompressionBombError above 2x MAX_IMAGE_PIXELS;
-            # below that it emits DecompressionBombWarning. Escalate the warning
-            # to an error so bombs are caught at the configured threshold, not 2x it.
-            with warnings.catch_warnings():
-                warnings.filterwarnings("error", category=Image.DecompressionBombWarning)
-                try:
-                    with Image.open(path) as img:
-                        fmt, mode = img.format, img.mode
-                        width, height = img.size
-                except UnidentifiedImageError:
-                    warning_messages.append("File is not a recognized image format")
-                except (Image.DecompressionBombWarning, Image.DecompressionBombError) as e:
-                    raise DecompressionBombError(str(e)) from e
-        finally:
-            Image.MAX_IMAGE_PIXELS = previous_max
+        # Save/restore Pillow's module-level threshold under a lock so concurrent
+        # extract() calls don't race on the global state. See module-level comment.
+        with _PILLOW_MAX_PIXELS_LOCK:
+            previous_max = Image.MAX_IMAGE_PIXELS
+            Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+            try:
+                # Pillow only RAISES DecompressionBombError above 2x MAX_IMAGE_PIXELS;
+                # below that it emits DecompressionBombWarning. Escalate the warning
+                # to an error so bombs are caught at the configured threshold, not 2x it.
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("error", category=Image.DecompressionBombWarning)
+                    try:
+                        with Image.open(path) as img:
+                            fmt, mode = img.format, img.mode
+                            width, height = img.size
+                    except UnidentifiedImageError:
+                        warning_messages.append("File is not a recognized image format")
+                    except (Image.DecompressionBombWarning, Image.DecompressionBombError) as e:
+                        raise DecompressionBombError(str(e)) from e
+            finally:
+                Image.MAX_IMAGE_PIXELS = previous_max
 
         info = FileInfo(
             path=str(path),

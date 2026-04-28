@@ -8,6 +8,7 @@ from pixel_probe.exceptions import (
     CorruptMetadataError,
     DecompressionBombError,
     FileTooLargeError,
+    MissingFileError,
     PixelProbeError,
     UnsupportedFormatError,
 )
@@ -21,6 +22,7 @@ def test_all_subclasses_inherit_from_pixel_probe_error() -> None:
     """Every domain exception must inherit from the base — that's how callers
     catch the family with one ``except`` clause."""
     for cls in (
+        MissingFileError,
         UnsupportedFormatError,
         CorruptMetadataError,
         FileTooLargeError,

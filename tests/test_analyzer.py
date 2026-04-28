@@ -18,8 +18,6 @@ from .conftest import fixture_path
 class _OkExtractor(Extractor[dict[str, Any]]):
     """Test double — returns a fixed payload."""
 
-    payload_type = dict
-
     def __init__(self, name: str, payload: dict[str, Any] | None = None) -> None:
         self.name = name
         self._payload = payload if payload is not None else {"ok": True}
@@ -35,8 +33,6 @@ class _RaisingExtractor(Extractor[dict[str, Any]]):
     orchestrator's catch-all stops at ``Exception`` and lets ``KeyboardInterrupt``
     propagate.
     """
-
-    payload_type = dict
 
     def __init__(self, name: str, exc: BaseException) -> None:
         self.name = name

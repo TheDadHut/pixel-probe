@@ -11,8 +11,9 @@ Usage:
     make fixtures
     # equivalent to:  python scripts/build_fixtures.py
 
-Run this script after a Pillow major version bump if the SHA assertions
-in ``tests/test_file_info.py`` start failing.
+Run this script if the SHA assertions in ``tests/test_file_info.py`` start
+failing — typically after a Pillow upgrade (any version) that shifts the
+encoder's output bytes, even on minor / patch releases.
 """
 
 from __future__ import annotations
