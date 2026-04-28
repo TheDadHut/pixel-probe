@@ -15,8 +15,8 @@ jobs:
     name: Lint & type check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
           cache: pip
@@ -39,8 +39,8 @@ jobs:
         python-version: ["3.11", "3.14"]
         os: [ubuntu-latest, windows-latest]   # macOS rejected — see PLAN.md §1.E4
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -75,7 +75,7 @@ jobs:
 
       - name: Upload coverage HTML report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-html-py${{ matrix.python-version }}-${{ matrix.os }}
           path: htmlcov/
@@ -83,7 +83,7 @@ jobs:
 
       - name: Upload JUnit XML
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: junit-py${{ matrix.python-version }}-${{ matrix.os }}
           path: junit.xml
@@ -112,7 +112,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Download all JUnit artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: junit-*
