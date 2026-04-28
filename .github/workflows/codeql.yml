@@ -1,0 +1,28 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  # Mirrors ci.yml: any PR triggers analysis, regardless of target branch.
+  # Stacked PRs (PR-on-PR) get scanned at every level.
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"   # weekly Monday rescan, 06:00 UTC
+
+jobs:
+  analyze:
+    name: Analyze (python)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-and-quality
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"

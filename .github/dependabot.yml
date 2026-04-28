@@ -1,0 +1,37 @@
+version: 2
+
+updates:
+  # Python runtime + dev deps
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - python
+    groups:
+      # Bundle dev minor/patch bumps into one weekly PR — keeps noise floor low.
+      # Major bumps still come as individual PRs (often need code review).
+      python-dev:
+        dependency-type: development
+        update-types:
+          - minor
+          - patch
+
+  # GitHub Actions used in workflows
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - ci
+    groups:
+      # Same pattern as Python deps: bundle minor/patch into one weekly PR.
+      # Major bumps (e.g. checkout@v3 → v4) often have breaking changes
+      # and stay as individual PRs that need review.
+      github-actions:
+        update-types:
+          - minor
+          - patch
