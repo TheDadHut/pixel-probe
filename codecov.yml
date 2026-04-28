@@ -1,0 +1,39 @@
+# Codecov configuration. Docs: https://docs.codecov.com/docs/codecov-yaml
+#
+# Coverage strategy:
+# - Project-wide floor of 75% mirrors the CI --cov-fail-under gate. CI fails
+#   first; Codecov is the secondary signal for slow-drift regressions.
+# - Patch (diff-coverage) target of 80% — new code should be well-covered.
+# - The `extractors` component bumps the target to 90% because it's the
+#   load-bearing logic per the testing strategy. This is enforced via a
+#   second status check, separate from the global one.
+
+coverage:
+  precision: 2
+  round: down
+  range: "70...100"
+
+  status:
+    project:
+      default:
+        target: 75%
+        threshold: 1%             # tolerate 1% drift without failing
+        if_not_found: success     # don't fail when no coverage report yet (Phase 0)
+    patch:
+      default:
+        target: 80%
+        threshold: 5%
+
+comment:
+  layout: "header, diff, components, files"
+  require_changes: false          # always comment, even when coverage is unchanged
+
+component_management:
+  individual_components:
+    - component_id: extractors
+      name: Extractors
+      paths:
+        - "src/pixel_probe/core/extractors/**"
+      statuses:
+        - type: project
+          target: 90%             # load-bearing logic — higher bar
