@@ -11,6 +11,8 @@ Format: [MADR](https://adr.github.io/madr/) (Status / Context / Decision / Conse
 - [0003 — Hybrid result shape (dataclass envelope + dict payload)](0003-hybrid-result-shape.md)
 - [0004 — Constructor DI over plugin entry points](0004-constructor-di-over-plugins.md)
 - [0005 — Sequential extraction (no `ThreadPoolExecutor`)](0005-sequential-extraction.md)
+- [0006 — Custom exception hierarchy](0006-custom-exception-hierarchy.md)
+- [0007 — Adversarial input handling](0007-adversarial-input-handling.md)
 
 ## When to write a new ADR
 
