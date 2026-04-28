@@ -81,7 +81,9 @@ python -m pixel_probe.gui.main_window
 ```bash
 make install     # pip install -e ".[dev]" + pre-commit install
 make test        # pytest
+make coverage    # pytest with coverage; HTML report at htmlcov/index.html
 make lint        # ruff check + ruff format --check + mypy
+make format      # ruff format + ruff check --fix
 make run         # launch the GUI
 make cli ARGS="path/to/image.jpg --json"
 ```
