@@ -1,5 +1,8 @@
 # pixel-probe
 
+[![CI](https://github.com/TheDadHut/pixel-probe/actions/workflows/ci.yml/badge.svg)](https://github.com/TheDadHut/pixel-probe/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/TheDadHut/pixel-probe/actions/workflows/codeql.yml/badge.svg)](https://github.com/TheDadHut/pixel-probe/actions/workflows/codeql.yml)
+[![codecov](https://codecov.io/gh/TheDadHut/pixel-probe/branch/main/graph/badge.svg)](https://codecov.io/gh/TheDadHut/pixel-probe)
 [![Python: 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-261230.svg)](https://github.com/astral-sh/ruff)
@@ -33,7 +36,7 @@ src/pixel_probe/
 
 Two parallel package families: **`extractors/`** read embedded bytes (EXIF, IPTC, XMP, file metadata — fast, can be empty); future **`analyzers/`** compute from pixels (histogram, dominant colours — slower, always produce output). They share an `Extractor[T]` ABC but live in separate packages because they have genuinely different perf profiles and failure modes.
 
-Architectural decisions land as ADRs in `docs/adr/` (PR 0b).
+Architectural decisions are documented as ADRs in [`docs/adr/`](docs/adr/) — five initial decisions covering the extractor/analyzer split, hand-rolled IPTC parsing, the hybrid result shape, constructor DI vs plugin entry points, and sequential-vs-parallel extraction.
 
 ## Install
 
