@@ -23,6 +23,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+import piexif
 from PIL import Image
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests" / "fixtures"
@@ -49,12 +50,71 @@ def _build_not_an_image(out: Path) -> None:
     out.write_bytes(b"This is not an image file.\n")
 
 
+def _build_exif_rich_jpeg(out: Path) -> None:
+    """100x100 JPEG with rich EXIF: make/model/exposure/ISO/focal length/date."""
+    img = Image.new("RGB", (100, 100), color=(50, 100, 150))
+    exif_dict = {
+        "0th": {
+            piexif.ImageIFD.Make: b"TestCorp",
+            piexif.ImageIFD.Model: b"TestModel X1",
+            piexif.ImageIFD.Software: b"pixel-probe-fixtures",
+            piexif.ImageIFD.DateTime: b"2026:01:15 14:30:00",
+        },
+        "Exif": {
+            piexif.ExifIFD.ExposureTime: (1, 250),  # 1/250 second
+            piexif.ExifIFD.FNumber: (28, 10),  # f/2.8
+            piexif.ExifIFD.ISOSpeedRatings: 400,
+            piexif.ExifIFD.FocalLength: (50, 1),  # 50 mm
+            piexif.ExifIFD.DateTimeOriginal: b"2026:01:15 14:30:00",
+        },
+        "GPS": {},
+        "1st": {},
+        "thumbnail": None,
+    }
+    exif_bytes = piexif.dump(exif_dict)
+    img.save(out, format="JPEG", quality=80, exif=exif_bytes)
+
+
+def _build_exif_with_gps_jpeg(out: Path) -> None:
+    """100x100 JPEG with GPS coords pointing at a deterministic location.
+
+    37° 46' 30" N, 122° 25' 15" W ≈ San Francisco-ish. Tests assert against
+    the exact decimal-degrees conversion so this needs to stay stable.
+    """
+    img = Image.new("RGB", (100, 100), color=(100, 50, 150))
+    gps_ifd = {
+        piexif.GPSIFD.GPSVersionID: (2, 0, 0, 0),
+        piexif.GPSIFD.GPSLatitudeRef: b"N",
+        piexif.GPSIFD.GPSLatitude: ((37, 1), (46, 1), (30, 1)),
+        piexif.GPSIFD.GPSLongitudeRef: b"W",
+        piexif.GPSIFD.GPSLongitude: ((122, 1), (25, 1), (15, 1)),
+    }
+    exif_dict = {
+        "0th": {},
+        "Exif": {},
+        "GPS": gps_ifd,
+        "1st": {},
+        "thumbnail": None,
+    }
+    exif_bytes = piexif.dump(exif_dict)
+    img.save(out, format="JPEG", quality=80, exif=exif_bytes)
+
+
+def _build_exif_none_jpeg(out: Path) -> None:
+    """100x100 JPEG explicitly without an EXIF block."""
+    img = Image.new("RGB", (100, 100), color=(150, 100, 50))
+    img.save(out, format="JPEG", quality=80)
+
+
 def main() -> int:
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
     builders: list[tuple[str, Callable[[Path], None]]] = [
         ("tiny.jpg", _build_tiny_jpeg),
         ("tiny.png", _build_tiny_png),
         ("not_an_image.txt", _build_not_an_image),
+        ("exif_rich.jpg", _build_exif_rich_jpeg),
+        ("exif_with_gps.jpg", _build_exif_with_gps_jpeg),
+        ("exif_none.jpg", _build_exif_none_jpeg),
     ]
     print(f"Writing fixtures to {FIXTURES_DIR}")
     for name, build in builders:
