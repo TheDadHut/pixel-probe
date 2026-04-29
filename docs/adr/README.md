@@ -13,6 +13,7 @@ Format: [MADR](https://adr.github.io/madr/) (Status / Context / Decision / Conse
 - [0005 — Sequential extraction (no `ThreadPoolExecutor`)](0005-sequential-extraction.md)
 - [0006 — Custom exception hierarchy](0006-custom-exception-hierarchy.md)
 - [0007 — Adversarial input handling](0007-adversarial-input-handling.md)
+- [0008 — EXIF parsing strategy](0008-exif-parsing-strategy.md)
 
 ## When to write a new ADR
 
