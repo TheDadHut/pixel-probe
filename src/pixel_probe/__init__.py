@@ -3,7 +3,14 @@
 from importlib.metadata import PackageNotFoundError, version
 
 from .core import AnalysisResult, Analyzer
-from .core.extractors import Extractor, ExtractorResult, FileInfo, FileInfoExtractor
+from .core.extractors import (
+    ExifData,
+    ExifExtractor,
+    Extractor,
+    ExtractorResult,
+    FileInfo,
+    FileInfoExtractor,
+)
 from .exceptions import (
     CorruptMetadataError,
     DecompressionBombError,
@@ -23,6 +30,8 @@ __all__ = [
     "Analyzer",
     "CorruptMetadataError",
     "DecompressionBombError",
+    "ExifData",
+    "ExifExtractor",
     "Extractor",
     "ExtractorResult",
     "FileInfo",

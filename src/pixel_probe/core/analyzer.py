@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .extractors.base import Extractor, ExtractorResult
+from .extractors.exif import ExifExtractor
 from .extractors.file_info import FileInfoExtractor
 
 __all__ = [
@@ -63,10 +64,11 @@ class Analyzer:
     def default(cls) -> Analyzer:
         """Return an :class:`Analyzer` configured with the built-in extractors.
 
-        v0.1: file_info only. Phases 2-3 add EXIF, IPTC, XMP — each lands
-        with its extractor wired in here.
+        v0.1: file_info + EXIF. Phase 3 adds IPTC + XMP — each lands here.
+        Order matters for downstream rendering (CLI / GUI tree both display
+        in declared order); file-level metadata first, then format-specific.
         """
-        return cls([FileInfoExtractor()])
+        return cls([FileInfoExtractor(), ExifExtractor()])
 
     def analyze(self, path: Path) -> AnalysisResult:
         """Run every extractor against ``path``; return the aggregate.
