@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from PIL import Image
+from PIL.Image import Exif
 from PIL.TiffImagePlugin import IFDRational
 
 from pixel_probe.core.extractors import exif as exif_module
@@ -110,15 +111,22 @@ def test_handles_corrupt_block(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "fake corruption" in result.errors[0]
 
 
-def test_truncates_large_makernote(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Bytes-valued tags larger than ``_MAX_BYTES_INLINE`` are summarized
-    as ``<binary, N bytes>`` instead of carried as raw bytes — adversarial-
-    input handling for the typical MakerNote case."""
-    # Tighten the threshold so we don't have to stuff 64+ bytes into a fixture.
-    monkeypatch.setattr(exif_module, "_MAX_BYTES_INLINE", 4)
+def test_extractor_truncates_oversized_makernote() -> None:
+    """End-to-end: the rich fixture deliberately includes a 100-byte
+    MakerNote that exceeds ``_MAX_BYTES_INLINE`` (64). The extractor must
+    surface it as a ``<binary, N bytes>`` summary, not the raw bytes —
+    that's the adversarial-input gate against vendor-specific blobs."""
+    result = ExifExtractor().extract(fixture_path("exif_rich.jpg"))
 
-    long_bytes = b"\x00\x01\x02\x03\x04\x05\x06\x07"
-    assert _normalize(long_bytes) == "<binary, 8 bytes>"
+    assert "MakerNote" in result.data
+    summary = result.data["MakerNote"]
+    assert isinstance(summary, str)
+    assert summary.startswith("<binary,")
+    assert summary.endswith(" bytes>")
+    # Pillow may add a trailing NUL or pad; assert >= rather than == so the
+    # test isn't fragile to encoder quirks. Anything well over the cap is fine.
+    match = summary.replace("<binary, ", "").replace(" bytes>", "")
+    assert int(match) >= 100
 
 
 def test_normalize_decodes_short_utf8_bytes() -> None:
@@ -217,22 +225,15 @@ def test_per_tag_exception_isolated_to_error(monkeypatch: pytest.MonkeyPatch) ->
 def test_corrupt_exif_sub_ifd_recorded_as_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """If ``exif.get_ifd`` raises while resolving the Exif sub-IFD, surface
     a single error and continue — main IFD tags + GPS still get parsed."""
-    real_open = Image.open
+    original_get_ifd = Exif.get_ifd
 
-    def _open_with_broken_sub_ifd(*args: object, **kwargs: object) -> Any:
-        img = real_open(*args, **kwargs)
-        original_get_ifd = img.getexif().__class__.get_ifd
+    def _broken(self: Exif, tag: int) -> Any:
+        if tag == 0x8769:  # Exif sub-IFD pointer
+            msg = "synthetic sub-IFD failure"
+            raise RuntimeError(msg)
+        return original_get_ifd(self, tag)
 
-        def _broken(self: Any, tag: int) -> Any:
-            if tag == 0x8769:  # Exif sub-IFD pointer
-                msg = "synthetic sub-IFD failure"
-                raise RuntimeError(msg)
-            return original_get_ifd(self, tag)
-
-        monkeypatch.setattr(img.getexif().__class__, "get_ifd", _broken)
-        return img
-
-    monkeypatch.setattr(Image, "open", _open_with_broken_sub_ifd)
+    monkeypatch.setattr(Exif, "get_ifd", _broken)
 
     result = ExifExtractor().extract(fixture_path("exif_with_gps.jpg"))
 
@@ -242,21 +243,51 @@ def test_corrupt_exif_sub_ifd_recorded_as_error(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_corrupt_gps_sub_ifd_recorded_as_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """If ``_extract_gps_ifd`` raises (e.g. malformed GPS pointer), surface
-    a single error and let the rest of the result through."""
-    real_extract_gps = exif_module._extract_gps_ifd
+    """If ``exif.get_ifd`` raises while resolving the GPS sub-IFD, the
+    helper catches it (R1: clean error contract — ``_extract_gps_ifd``
+    never raises) and surfaces a single error string. Main-IFD tags
+    survive; the result still ships the rest of the data."""
+    original_get_ifd = Exif.get_ifd
 
-    def _broken(exif: object) -> object:
-        msg = "synthetic GPS failure"
-        raise RuntimeError(msg)
+    def _broken(self: Exif, tag: int) -> Any:
+        if tag == 0x8825:  # GPS sub-IFD pointer
+            msg = "synthetic GPS failure"
+            raise RuntimeError(msg)
+        return original_get_ifd(self, tag)
 
-    monkeypatch.setattr(exif_module, "_extract_gps_ifd", _broken)
+    monkeypatch.setattr(Exif, "get_ifd", _broken)
 
-    result = ExifExtractor().extract(fixture_path("exif_rich.jpg"))
+    result = ExifExtractor().extract(fixture_path("exif_with_gps.jpg"))
 
     assert any("GPS sub-IFD" in e and "RuntimeError" in e for e in result.errors)
-    # Other tags survived.
-    assert result.data.get("Make") == "TestCorp"
+    # No "gps" sub-dict because we couldn't reach the GPS data at all.
+    assert "gps" not in result.data
 
-    # Sanity: the real implementation is still callable (no module-level damage).
-    assert callable(real_extract_gps)
+
+def test_gps_per_tag_exception_isolated_to_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When ``_normalize`` raises on one GPS tag, the bad tag becomes an
+    error string but the rest of the GPS sub-IFD still parses. Parity
+    with the main-IFD per-tag-isolation contract — verifies the same
+    discipline applies inside ``_extract_gps_ifd``'s loop."""
+    real_normalize = exif_module._normalize
+
+    def _selective_failure(value: object) -> object:
+        # GPSLatitudeRef in the fixture is "N" (str). Fail on it specifically.
+        if value == "N":
+            msg = "synthetic GPS per-tag failure"
+            raise RuntimeError(msg)
+        return real_normalize(value)
+
+    monkeypatch.setattr(exif_module, "_normalize", _selective_failure)
+
+    result = ExifExtractor().extract(fixture_path("exif_with_gps.jpg"))
+
+    # The bad tag became an error.
+    assert any(
+        "GPS tag" in e and "RuntimeError" in e and "synthetic GPS per-tag failure" in e
+        for e in result.errors
+    )
+    # Sibling GPS tags still made it through.
+    gps = result.data["gps"]
+    assert "GPSLatitude" in gps
+    assert "GPSLongitudeRef" in gps

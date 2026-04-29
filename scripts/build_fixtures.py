@@ -51,8 +51,13 @@ def _build_not_an_image(out: Path) -> None:
 
 
 def _build_exif_rich_jpeg(out: Path) -> None:
-    """100x100 JPEG with rich EXIF: make/model/exposure/ISO/focal length/date."""
+    """100x100 JPEG with rich EXIF: make/model/exposure/ISO/focal length/date,
+    plus a deliberately oversized 100-byte MakerNote that exercises the
+    bytes-summarization gate in _normalize.
+    """
     img = Image.new("RGB", (100, 100), color=(50, 100, 150))
+    # 100 bytes of "vendor-specific" binary; beyond _MAX_BYTES_INLINE (64).
+    oversized_makernote = bytes(range(100))
     exif_dict = {
         "0th": {
             piexif.ImageIFD.Make: b"TestCorp",
@@ -66,6 +71,7 @@ def _build_exif_rich_jpeg(out: Path) -> None:
             piexif.ExifIFD.ISOSpeedRatings: 400,
             piexif.ExifIFD.FocalLength: (50, 1),  # 50 mm
             piexif.ExifIFD.DateTimeOriginal: b"2026:01:15 14:30:00",
+            piexif.ExifIFD.MakerNote: oversized_makernote,
         },
         "GPS": {},
         "1st": {},
@@ -82,8 +88,10 @@ def _build_exif_with_gps_jpeg(out: Path) -> None:
     the exact decimal-degrees conversion so this needs to stay stable.
     """
     img = Image.new("RGB", (100, 100), color=(100, 50, 150))
+    # Drop GPSVersionID — it round-trips through Pillow as a 4-byte string
+    # that NUL-trims to "" in the result, which is just noise. None
+    # of our tests exercise it.
     gps_ifd = {
-        piexif.GPSIFD.GPSVersionID: (2, 0, 0, 0),
         piexif.GPSIFD.GPSLatitudeRef: b"N",
         piexif.GPSIFD.GPSLatitude: ((37, 1), (46, 1), (30, 1)),
         piexif.GPSIFD.GPSLongitudeRef: b"W",

@@ -51,8 +51,11 @@ _GPS_INFO_TAG: Final = 0x8825
 #: Interoperability sub-IFD pointer.
 _INTEROP_IFD_TAG: Final = 0xA005
 
-#: Tags whose values are sub-IFD pointers — we walk into them rather than
-#: surfacing the raw pointer integer in the result dict.
+#: Tags whose values are sub-IFD pointers — we walk Exif and GPS explicitly
+#: below; Interop is included here so its raw pointer integer doesn't leak
+#: into the result, but its sub-IFD is intentionally NOT walked. Interop
+#: tags (related-image-file format, thumbnail interop) are rarely useful
+#: and walking them would expand the API surface for negligible benefit.
 _SUB_IFD_POINTERS: Final = frozenset({_EXIF_IFD_TAG, _GPS_INFO_TAG, _INTEROP_IFD_TAG})
 
 
@@ -85,6 +88,11 @@ def _dms_to_decimal(dms: tuple[float, float, float], ref: str) -> float:
 
     Pure function — same input always gives the same output, no side effects.
     Hypothesis-tested in ``tests/property/test_exif_normalize.py``.
+
+    Raises ``TypeError`` / ``ValueError`` / ``ZeroDivisionError`` on malformed
+    input (non-numeric values, non-3-tuple, etc.) — caller is expected to
+    catch and surface as an error string. Input validation gates the call
+    site (see :func:`_extract_gps_ifd`); this function trusts its inputs.
     """
     degrees, minutes, seconds = dms
     decimal = degrees + minutes / 60 + seconds / 3600
@@ -96,13 +104,16 @@ def _dms_to_decimal(dms: tuple[float, float, float], ref: str) -> float:
 def _extract_gps_ifd(exif: Image.Exif) -> tuple[dict[str, Any], list[str]]:
     """Build a ``gps`` sub-dict from EXIF's GPS sub-IFD.
 
-    Returns ``({}, [])`` when no GPS sub-IFD is present. Returns
-    ``(gps_dict, errors)`` otherwise — the second element accumulates
-    per-tag and per-conversion failures for the caller to attach to
-    the result envelope.
+    **Never raises.** All failures (corrupt sub-IFD pointer, per-tag
+    normalization errors, DMS conversion errors) are returned as strings
+    in the second tuple element; the caller attaches them to the result
+    envelope. Returns ``({}, [])`` when no GPS sub-IFD is present.
     """
     errors: list[str] = []
-    gps_ifd = exif.get_ifd(_GPS_INFO_TAG)
+    try:
+        gps_ifd = exif.get_ifd(_GPS_INFO_TAG)
+    except Exception as e:  # noqa: BLE001 - we promise to never raise out of this fn
+        return {}, [f"GPS sub-IFD: {type(e).__name__}: {e}"]
     if not gps_ifd:
         return {}, errors
 
@@ -117,19 +128,21 @@ def _extract_gps_ifd(exif: Image.Exif) -> tuple[dict[str, Any], list[str]]:
     # Convenience: surface latitude/longitude as decimal degrees alongside
     # the raw DMS tuples. Callers that want GPS in any practical way want
     # decimals; the raw DMS stays available for those who need it.
+    # Accept both tuple and list — Pillow normally returns tuple, but we
+    # don't want a defensive shape change to silently drop the conversion.
     lat = gps.get("GPSLatitude")
     lat_ref = gps.get("GPSLatitudeRef")
-    if isinstance(lat, tuple) and len(lat) == 3 and isinstance(lat_ref, str):
+    if isinstance(lat, tuple | list) and len(lat) == 3 and isinstance(lat_ref, str):
         try:
-            gps["latitude"] = _dms_to_decimal(lat, lat_ref)
+            gps["latitude"] = _dms_to_decimal(tuple(lat), lat_ref)
         except (TypeError, ValueError, ZeroDivisionError) as e:
             errors.append(f"GPS latitude conversion: {type(e).__name__}: {e}")
 
     lon = gps.get("GPSLongitude")
     lon_ref = gps.get("GPSLongitudeRef")
-    if isinstance(lon, tuple) and len(lon) == 3 and isinstance(lon_ref, str):
+    if isinstance(lon, tuple | list) and len(lon) == 3 and isinstance(lon_ref, str):
         try:
-            gps["longitude"] = _dms_to_decimal(lon, lon_ref)
+            gps["longitude"] = _dms_to_decimal(tuple(lon), lon_ref)
         except (TypeError, ValueError, ZeroDivisionError) as e:
             errors.append(f"GPS longitude conversion: {type(e).__name__}: {e}")
 
@@ -155,7 +168,6 @@ class ExifExtractor(Extractor[ExifData]):
         if not path.is_file():
             raise MissingFileError(f"Not a file: {path}")
 
-        warnings: list[str] = []
         errors: list[str] = []
         data: ExifData = {}
 
@@ -202,14 +214,11 @@ class ExifExtractor(Extractor[ExifData]):
             except Exception as e:  # noqa: BLE001 - per-tag isolation
                 errors.append(f"Exif tag {tag_id}: {type(e).__name__}: {e}")
 
-        # GPS sub-IFD as data["gps"], if present.
-        try:
-            gps, gps_errors = _extract_gps_ifd(exif)
-        except Exception as e:  # noqa: BLE001 - bad sub-IFD → one error, not a crash
-            errors.append(f"GPS sub-IFD: {type(e).__name__}: {e}")
-            gps, gps_errors = {}, []
+        # GPS sub-IFD as data["gps"], if present. _extract_gps_ifd promises
+        # never to raise — all its failures come back as error strings.
+        gps, gps_errors = _extract_gps_ifd(exif)
         errors.extend(gps_errors)
         if gps:
             data["gps"] = gps
 
-        return ExtractorResult(self.name, data, tuple(warnings), tuple(errors))
+        return ExtractorResult(self.name, data, errors=tuple(errors))
