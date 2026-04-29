@@ -59,6 +59,9 @@ def _build_exif_rich_jpeg(out: Path) -> None:
     """100x100 JPEG with rich EXIF: make/model/exposure/ISO/focal length/date,
     plus a deliberately oversized 100-byte MakerNote that exercises the
     bytes-summarization gate in _normalize.
+
+    Authored via Pillow's native :class:`PIL.Image.Exif` API (see module
+    docstring for the dep-graph rationale).
     """
     img = Image.new("RGB", (100, 100), color=(50, 100, 150))
 
