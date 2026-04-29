@@ -264,6 +264,98 @@ def test_corrupt_gps_sub_ifd_recorded_as_error(monkeypatch: pytest.MonkeyPatch) 
     assert "gps" not in result.data
 
 
+def test_exif_sub_ifd_per_tag_exception_isolated_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-tag isolation parity: same contract as the main-IFD test, but
+    targeting a tag that lives in the Exif sub-IFD. The 100-byte MakerNote
+    value in ``exif_rich.jpg`` is unique to that sub-IFD walk, so the
+    raised error gets formatted with the ``Exif tag {tag_id}: ...`` prefix
+    rather than the main-IFD ``Tag {tag_id}: ...`` prefix."""
+    real_normalize = exif_module._normalize
+
+    def _selective_failure(value: object) -> object:
+        # The 100-byte MakerNote in exif_rich.jpg is the only bytes value
+        # at this exact length — Exif sub-IFD only.
+        if isinstance(value, bytes) and len(value) == 100:
+            msg = "synthetic Exif sub-IFD per-tag failure"
+            raise RuntimeError(msg)
+        return real_normalize(value)
+
+    monkeypatch.setattr(exif_module, "_normalize", _selective_failure)
+
+    result = ExifExtractor().extract(fixture_path("exif_rich.jpg"))
+
+    assert "MakerNote" not in result.data
+    assert "Make" in result.data  # main-IFD tags untouched
+    assert any(
+        "Exif tag" in e and "RuntimeError" in e and "synthetic Exif sub-IFD" in e
+        for e in result.errors
+    )
+
+
+def test_extract_gps_ifd_handles_partial_data() -> None:
+    """If a GPS sub-IFD has latitude data but no longitude (or vice versa),
+    the available conversion still runs; the missing one is silently
+    skipped via the isinstance gate. Direct unit test of
+    :func:`_extract_gps_ifd` against a stubbed Exif object — covers the
+    branch where the lon-side ``isinstance`` check fails but lat-side
+    succeeded."""
+
+    class _StubExif:
+        """Duck-typed stand-in for ``PIL.Image.Exif`` — the helper only
+        needs ``.get_ifd(tag)``; we don't need a real Pillow object."""
+
+        def get_ifd(self, tag: int) -> dict[int, Any]:
+            del tag
+            # Use already-flat floats — _normalize would normally produce these
+            # from IFDRationals, but our stub bypasses Pillow's parsing.
+            return {
+                0x0001: "N",  # GPSLatitudeRef
+                0x0002: (37.0, 46.0, 30.0),  # GPSLatitude
+                # GPSLongitude / GPSLongitudeRef deliberately absent.
+            }
+
+    gps, errors = exif_module._extract_gps_ifd(_StubExif())  # type: ignore[arg-type]
+
+    assert errors == []
+    assert "latitude" in gps  # lat conversion ran
+    assert "longitude" not in gps  # lon block skipped via isinstance gate
+
+
+def test_gps_dms_conversion_errors_recorded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If ``_dms_to_decimal`` raises, both the latitude and longitude
+    conversion attempts append error strings — but the raw DMS rationals
+    still ship in ``data["gps"]``. This covers the defensive
+    ``(TypeError, ValueError, ZeroDivisionError)`` catches: they exist
+    for unusual GPS encodings that pass the isinstance gate but would
+    crash arithmetic (e.g. a tuple of strings that monkey-patched
+    ``_normalize`` returned unchanged)."""
+
+    def _broken(dms: tuple[float, float, float], ref: str) -> float:
+        del dms, ref
+        msg = "synthetic DMS conversion failure"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(exif_module, "_dms_to_decimal", _broken)
+
+    result = ExifExtractor().extract(fixture_path("exif_with_gps.jpg"))
+
+    lat_errors = [e for e in result.errors if "GPS latitude conversion" in e]
+    lon_errors = [e for e in result.errors if "GPS longitude conversion" in e]
+    assert len(lat_errors) == 1
+    assert len(lon_errors) == 1
+    assert "ValueError" in lat_errors[0]
+
+    # Raw DMS data still preserved — only the decimal-conversion step failed.
+    gps = result.data["gps"]
+    assert gps["GPSLatitude"] == (37.0, 46.0, 30.0)
+    assert gps["GPSLongitude"] == (122.0, 25.0, 15.0)
+    # Decimal-degree convenience fields not produced (conversion failed).
+    assert "latitude" not in gps
+    assert "longitude" not in gps
+
+
 def test_gps_per_tag_exception_isolated_to_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """When ``_normalize`` raises on one GPS tag, the bad tag becomes an
     error string but the rest of the GPS sub-IFD still parses. Parity
