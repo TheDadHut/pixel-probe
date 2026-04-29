@@ -18,7 +18,14 @@ coverage:
       default:
         target: 75%
         threshold: 1%             # tolerate 1% drift without failing
-        if_not_found: success     # don't fail when no coverage report yet (Phase 0)
+        informational: false      # explicit: this IS a blocking status check.
+                                  # Forces Codecov to post the check even when
+                                  # comparison shows zero delta — without this,
+                                  # the bot was silently suppressing codecov/project
+                                  # because project coverage stayed at 100% across PRs.
+                                  # The earlier `if_not_found: success` directive was
+                                  # removed: it only applies when a report is missing
+                                  # (we always have one), so it was no-op noise.
     patch:
       default:
         target: 80%
