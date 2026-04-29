@@ -41,7 +41,6 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.10",
     "pre-commit>=3.7",
-    "piexif>=1.1",  # used only by scripts/build_fixtures.py to write EXIF/GPS
 ]
 docs = [
     "sphinx>=7",

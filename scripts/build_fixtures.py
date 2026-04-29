@@ -14,6 +14,10 @@ Usage:
 Run this script if the SHA assertions in ``tests/test_file_info.py`` start
 failing — typically after a Pillow upgrade (any version) that shifts the
 encoder's output bytes, even on minor / patch releases.
+
+EXIF authoring uses Pillow's native :class:`PIL.Image.Exif` API rather than
+a third-party library — keeps the dev-dep graph minimal and means we
+exercise the same write path Pillow consumers use in production.
 """
 
 from __future__ import annotations
@@ -23,8 +27,9 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-import piexif
 from PIL import Image
+from PIL.ExifTags import GPS, Base
+from PIL.TiffImagePlugin import IFDRational
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests" / "fixtures"
 
@@ -54,58 +59,57 @@ def _build_exif_rich_jpeg(out: Path) -> None:
     """100x100 JPEG with rich EXIF: make/model/exposure/ISO/focal length/date,
     plus a deliberately oversized 100-byte MakerNote that exercises the
     bytes-summarization gate in _normalize.
+
+    Authored via Pillow's native :class:`PIL.Image.Exif` API (see module
+    docstring for the dep-graph rationale).
     """
     img = Image.new("RGB", (100, 100), color=(50, 100, 150))
+
+    exif = Image.Exif()
+    # Main IFD tags.
+    exif[Base.Make.value] = "TestCorp"
+    exif[Base.Model.value] = "TestModel X1"
+    exif[Base.Software.value] = "pixel-probe-fixtures"
+    exif[Base.DateTime.value] = "2026:01:15 14:30:00"
+
+    # Exif sub-IFD tags — accessed by getting/creating the sub-IFD via its
+    # pointer tag, then mutating it in place. Pillow returns a live view.
+    exif_ifd = exif.get_ifd(Base.ExifOffset.value)
+    exif_ifd[Base.ExposureTime.value] = IFDRational(1, 250)  # 1/250 s
+    exif_ifd[Base.FNumber.value] = IFDRational(28, 10)  # f/2.8
+    exif_ifd[Base.ISOSpeedRatings.value] = 400
+    exif_ifd[Base.FocalLength.value] = IFDRational(50, 1)  # 50 mm
+    exif_ifd[Base.DateTimeOriginal.value] = "2026:01:15 14:30:00"
     # 100 bytes of "vendor-specific" binary; beyond _MAX_BYTES_INLINE (64).
-    oversized_makernote = bytes(range(100))
-    exif_dict = {
-        "0th": {
-            piexif.ImageIFD.Make: b"TestCorp",
-            piexif.ImageIFD.Model: b"TestModel X1",
-            piexif.ImageIFD.Software: b"pixel-probe-fixtures",
-            piexif.ImageIFD.DateTime: b"2026:01:15 14:30:00",
-        },
-        "Exif": {
-            piexif.ExifIFD.ExposureTime: (1, 250),  # 1/250 second
-            piexif.ExifIFD.FNumber: (28, 10),  # f/2.8
-            piexif.ExifIFD.ISOSpeedRatings: 400,
-            piexif.ExifIFD.FocalLength: (50, 1),  # 50 mm
-            piexif.ExifIFD.DateTimeOriginal: b"2026:01:15 14:30:00",
-            piexif.ExifIFD.MakerNote: oversized_makernote,
-        },
-        "GPS": {},
-        "1st": {},
-        "thumbnail": None,
-    }
-    exif_bytes = piexif.dump(exif_dict)
-    img.save(out, format="JPEG", quality=80, exif=exif_bytes)
+    exif_ifd[Base.MakerNote.value] = bytes(range(100))
+
+    img.save(out, format="JPEG", quality=80, exif=exif)
 
 
 def _build_exif_with_gps_jpeg(out: Path) -> None:
     """100x100 JPEG with GPS coords pointing at a deterministic location.
 
-    37° 46' 30" N, 122° 25' 15" W ≈ San Francisco-ish. Tests assert against
+    37° 46' 30" N, 122° 25' 15" W (≈ San Francisco). Tests assert against
     the exact decimal-degrees conversion so this needs to stay stable.
     """
     img = Image.new("RGB", (100, 100), color=(100, 50, 150))
-    # Drop GPSVersionID — it round-trips through Pillow as a 4-byte string
-    # that NUL-trims to "" in the result, which is just noise. None
-    # of our tests exercise it.
-    gps_ifd = {
-        piexif.GPSIFD.GPSLatitudeRef: b"N",
-        piexif.GPSIFD.GPSLatitude: ((37, 1), (46, 1), (30, 1)),
-        piexif.GPSIFD.GPSLongitudeRef: b"W",
-        piexif.GPSIFD.GPSLongitude: ((122, 1), (25, 1), (15, 1)),
-    }
-    exif_dict = {
-        "0th": {},
-        "Exif": {},
-        "GPS": gps_ifd,
-        "1st": {},
-        "thumbnail": None,
-    }
-    exif_bytes = piexif.dump(exif_dict)
-    img.save(out, format="JPEG", quality=80, exif=exif_bytes)
+
+    exif = Image.Exif()
+    gps_ifd = exif.get_ifd(Base.GPSInfo.value)
+    gps_ifd[GPS.GPSLatitudeRef.value] = "N"
+    gps_ifd[GPS.GPSLatitude.value] = (
+        IFDRational(37, 1),
+        IFDRational(46, 1),
+        IFDRational(30, 1),
+    )
+    gps_ifd[GPS.GPSLongitudeRef.value] = "W"
+    gps_ifd[GPS.GPSLongitude.value] = (
+        IFDRational(122, 1),
+        IFDRational(25, 1),
+        IFDRational(15, 1),
+    )
+
+    img.save(out, format="JPEG", quality=80, exif=exif)
 
 
 def _build_exif_none_jpeg(out: Path) -> None:
