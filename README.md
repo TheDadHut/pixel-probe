@@ -38,6 +38,10 @@ Two parallel package families: **`extractors/`** read embedded bytes (EXIF, IPTC
 
 Architectural decisions are documented as ADRs in [`docs/adr/`](docs/adr/) — five initial decisions covering the extractor/analyzer split, hand-rolled IPTC parsing, the hybrid result shape, constructor DI vs plugin entry points, and sequential-vs-parallel extraction.
 
+[![Coverage sunburst](https://codecov.io/gh/TheDadHut/pixel-probe/graphs/sunburst.svg?token=N6QJZMEVOH)](https://codecov.io/gh/TheDadHut/pixel-probe)
+
+*Inner ring = whole project; outer rings = folders → files. Slice size is statement count; colour is coverage.*
+
 ## Install
 
 ```bash
