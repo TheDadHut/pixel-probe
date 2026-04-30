@@ -56,6 +56,7 @@ from typing import Final
 
 from pixel_probe.exceptions import FileTooLargeError, MissingFileError
 
+from ._signatures import is_known_image_format
 from .base import Extractor, ExtractorResult
 from .file_info import MAX_FILE_SIZE_BYTES
 
@@ -287,11 +288,19 @@ class IptcExtractor(Extractor[IptcData]):
         data: IptcData = {}
 
         if not raw.startswith(_SOI):
-            # Zero-data failure: IPTC produces nothing for non-JPEG inputs.
-            # data=None + error per ADR 0011's normalization.
+            # Per ADR 0011: distinguish "image, just not a format we handle"
+            # (warning, with empty-dict data so consumers iterating mixed
+            # batches don't see false-alarm errors) from "not an image at
+            # all" (error, data=None).
+            if is_known_image_format(raw):
+                return ExtractorResult(
+                    self.name,
+                    {},
+                    warnings=("IPTC unavailable on this format; v0.1 supports JPEG only",),
+                )
             return ExtractorResult(
                 self.name,
-                errors=("File is not a JPEG; IPTC v0.1 supports JPEG only",),
+                errors=("File is not a recognized image format; IPTC requires JPEG",),
             )
 
         irb_payload = self._find_irb_payload(raw)

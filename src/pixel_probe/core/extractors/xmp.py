@@ -68,6 +68,7 @@ from defusedxml.ElementTree import fromstring as _safe_fromstring
 
 from pixel_probe.exceptions import FileTooLargeError, MissingFileError
 
+from ._signatures import is_known_image_format
 from .base import Extractor, ExtractorResult
 from .file_info import MAX_FILE_SIZE_BYTES
 
@@ -517,14 +518,21 @@ class XmpExtractor(Extractor[XmpData]):
         # window would be more memory-efficient but adds complexity v0.1
         # doesn't need — revisit if profiling shows pressure.
         raw = path.read_bytes()
-        data: XmpData = {}
 
         if not raw.startswith((_JPEG_SOI, _PNG_SIGNATURE)):
-            # Zero-data failure: XMP produces nothing for non-JPEG/PNG inputs.
-            # data=None + error per ADR 0011's normalization.
+            # Per ADR 0011: distinguish "image, just not a format we handle"
+            # (warning, with empty-dict data so consumers iterating mixed
+            # batches don't see false-alarm errors) from "not an image at
+            # all" (error, data=None).
+            if is_known_image_format(raw):
+                return ExtractorResult(
+                    self.name,
+                    {},
+                    warnings=("XMP unavailable on this format; v0.1 supports JPEG and PNG only",),
+                )
             return ExtractorResult(
                 self.name,
-                errors=("File is not a JPEG or PNG; XMP v0.1 supports JPEG/PNG only",),
+                errors=("File is not a recognized image format; XMP requires JPEG or PNG",),
             )
 
         packet, locator_warnings, locator_errors = _find_xmp_packet(raw)
@@ -544,7 +552,7 @@ class XmpExtractor(Extractor[XmpData]):
                 )
             return ExtractorResult(
                 self.name,
-                data,
+                {},
                 warnings=tuple(locator_warnings),
             )
 

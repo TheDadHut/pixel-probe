@@ -105,20 +105,19 @@ class Analyzer:
             try:
                 results[extractor.name] = extractor.extract(path)
             except PixelProbeError as e:
+                # ExtractorResult.data defaults to None — failure shape per ADR 0011.
                 results[extractor.name] = ExtractorResult(
                     extractor.name,
-                    data=None,
                     errors=(f"{type(e).__name__}: {e}",),
                 )
             except Exception as e:
                 logger.exception(
-                    "Unexpected exception in extractor %r processing %r — likely a bug",
+                    "Unexpected exception in extractor %s processing %s — likely a bug",
                     extractor.name,
                     path,
                 )
                 results[extractor.name] = ExtractorResult(
                     extractor.name,
-                    data=None,
                     errors=(f"BUG: {type(e).__name__}: {e}",),
                 )
         return AnalysisResult(str(path), results)

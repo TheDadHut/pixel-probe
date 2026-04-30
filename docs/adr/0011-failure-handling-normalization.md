@@ -20,9 +20,23 @@ These weren't blockers for v0.1. But the resulting asymmetry forced consumers to
 
 ## Decision
 
-### Failure semantics: `data=None` + error
+### Three-tier failure classification
 
-When an extractor produces **zero data** for an input — because the format is unsupported, the parser failed catastrophically, or some fundamental invariant was violated — the result envelope is:
+Per-extractor results fall into three severity tiers:
+
+| Tier | When | `data` | `errors` | `warnings` |
+|---|---|---|---|---|
+| **Success-but-empty** | extractor ran, file legitimately has no data of that kind (e.g. JPEG with no EXIF block) | `{}` (or empty payload) | `()` | `()` |
+| **Image, format gap** | input *is* a recognized image, just not a format this extractor handles (e.g. IPTC handed a PNG) | `{}` | `()` | `("...unavailable on this format; ...",)` |
+| **Failure** | extractor produced zero data because the input wasn't an image at all, or a parser/security gate rejected the bytes | `None` | `("...",)` | `()` unless unrelated anomaly |
+
+The image-format-gap tier exists because pixel-probe is a metadata inspector intended to run across mixed batches (a directory with JPEGs and PNGs and TIFFs). A user running it on a PNG legitimately expects "no IPTC" — surfacing that as an error would drown the actual failures in noise. The shared `is_known_image_format()` helper distinguishes the two cases via byte-prefix signature check.
+
+The split is "extractor failed to run" (`data=None`) vs "extractor ran (or correctly chose not to run) and the file had no relevant data" (`data={}`).
+
+### Failure semantics: `data=None` + error (specifically)
+
+When an extractor produces zero data because the input is **not an image at all** or because a **parser failed catastrophically**, the result envelope is:
 
 - `data = None`
 - `errors = (...,)` (one or more strings describing the failure)
@@ -30,19 +44,11 @@ When an extractor produces **zero data** for an input — because the format is 
 
 This applies uniformly across:
 
-- **Format-mismatch** at the per-extractor level (EXIF: non-image; IPTC: non-JPEG; XMP: non-JPEG/PNG). Was previously a warning with `data={}` — now an error with `data=None`.
+- **Non-image input** at the per-extractor level (EXIF: `UnidentifiedImageError`; IPTC: bytes not matching any recognized image signature; XMP: same).
 - **Whole-file parser failure** (EXIF: `getexif` raises; XMP: `defusedxml` raises `ParseError` or `DefusedXmlException`; XMP: malformed compressed iTXt / decompression bomb / unrecognized compression flag).
 - **Catastrophic file-level failures** (`MissingFileError`, `FileTooLargeError`, `DecompressionBombError`) raised by the extractor and caught by the orchestrator.
 
-`data == {}` is reserved for **success-but-empty**: the extractor ran successfully and the file legitimately has no metadata of that kind. Examples:
-
-- A valid JPEG with no EXIF block → `data={}` (EXIF extractor ran, found nothing).
-- A valid JPEG with no IPTC IRB → `data={}` (IPTC extractor ran, found nothing).
-- A valid JPEG/PNG with no XMP packet → `data={}` (XMP extractor ran, found nothing).
-
-The split is "extractor failed to run" (`data=None`) vs "extractor ran but the file had no relevant data" (`data={}`).
-
-**file_info is the principled exception.** It produces partial data for non-image files: SHA-256, size, and mtime are computed before any image-format check, so `data` is a populated `FileInfo` dataclass with image-level fields as `None`. This is partial extraction (some fields ship, others don't), and the warning surfacing the unrecognized format is the right severity for that case.
+**file_info is the principled exception** to the three-tier classification. It produces partial data for non-image files: SHA-256, size, and mtime are computed before any image-format check, so `data` is a populated `FileInfo` dataclass with image-level fields as `None`. This is partial extraction (some fields ship, others don't), and the warning surfacing the unrecognized format is the right severity for that case — it's neither a per-extractor format gap nor a complete failure.
 
 ### Orchestrator catch tiers
 
@@ -53,13 +59,16 @@ The split is "extractor failed to run" (`data=None`) vs "extractor ran but the f
 
 `KeyboardInterrupt`, `SystemExit`, and other `BaseException` subclasses still propagate unchanged — that part of [ADR 0005](0005-sequential-extraction.md) is preserved.
 
-### Why error-not-warning for format-mismatch
+### Why split format-mismatch into two tiers
 
-The old "warning + empty dict" framing was lenient — "you ran me on a non-image, that's odd but not an error." But:
+The original draft of this ADR collapsed format-mismatch and non-image into a single "zero data → error" rule. On review, that conflated two distinct cases:
 
-- **The user-visible signal matters.** A consumer iterating `result.errors` to count failures would have missed format-mismatch entirely. The signal-to-noise was wrong: format-mismatch is the loudest "I couldn't help you" message, not a quiet aside.
-- **It's symmetric with corrupt-block.** A malformed XMP packet was already an error; "wrong format entirely" is logically more severe, not less.
-- **`file_info` stays distinct.** It doesn't violate the new rule: it produces partial data, so warning-with-data is still right for it.
+- **Image-but-wrong-format** (PNG → IPTC) — the user's input is a real image, the extractor just doesn't apply. This is a routine outcome of running pixel-probe across a mixed-format directory; surfacing as an error would drown actual failures in noise.
+- **Non-image entirely** (text file → IPTC) — the user pointed pixel-probe at something that isn't an image. Real failure; error severity is right.
+
+Distinguishing them costs ~10 lines: a shared `is_known_image_format()` helper that does byte-prefix signature detection, plus a 4-line dispatch in each affected extractor. The output is a meaningfully different UX for legitimate batch workflows.
+
+`file_info` doesn't sit in this classification — it ships partial data for non-images and uses `warnings` to surface the format gap. Documented above as the principled exception.
 
 ### Why log + bug-prefix for unexpected exceptions
 
@@ -73,12 +82,13 @@ Operators see what's broken; consumers see the failure; the run completes. All t
 
 ## Consequences
 
-- ✅ **Uniform failure contract.** `data is None` ↔ failure; `data == {}` ↔ success-but-empty; `result.has_data` (the existing convenience property) does the right thing for both. No more per-extractor variance in failure shape.
-- ✅ **Format-mismatch is loud.** Consumers see it on `result.errors` like any other failure. No silent miss.
+- ✅ **Three-tier failure classification** matches the actual UX the tool needs to deliver — success-but-empty stays quiet, image-format-gap surfaces as a warning, true failures surface as errors. Mixed-format batch runs don't drown in false-alarm errors for routine PNG-without-IPTC cases.
+- ✅ **Uniform failure-tier shape across extractors.** `data is None` ↔ failure; `data == {}` ↔ either success-but-empty or image-format-gap; `result.has_data` (the existing convenience property) is correct for all three tiers (any of them returns `False` if data is empty/None).
 - ✅ **Bugs are visible.** `logging.exception` surfaces the traceback; `"BUG: "` prefix flags the result for human attention. ADR 0005's resilience guarantee (one bad extractor doesn't kill the rest) preserved.
 - ✅ **`PixelProbeError` typed filtering still works** for catastrophic file-level failures. Callers using direct `extractor.extract()` (not via orchestrator) can still `except FileTooLargeError`.
-- ❌ **Behavior change for consumers** that assumed `data == {}` after format-mismatch (now `data is None`). Caught by tests; documented here. Acceptable at v0.1-dev.
+- ❌ **Behavior change for consumers** that assumed `data == {}` after non-image input (now `data is None`). Caught by tests; documented here. Acceptable at v0.1-dev.
 - ❌ **Two error-string formats.** `"MissingFileError: ..."` (expected) vs `"BUG: KeyError: ..."` (unexpected). Consumers grep for `"BUG:"` if they care about the distinction.
 - ❌ **Logging is configured per the consuming application**, not by pixel-probe. A library that doesn't configure logging will see bugs go to the default handler (stderr). Acceptable — that's standard Python library practice.
+- ❌ **`is_known_image_format()` is a fixed list of magic bytes.** Niche image formats (JPEG 2000, AVIF, HEIF, etc.) get classified as "non-image" → error rather than warning. Adding to the helper is one-line work; v0.1's list covers the formats users plausibly run pixel-probe against.
 - 🔄 **Reconsider the `"BUG: "` prefix** if a real consumer wants typed bug filtering. A sentinel attribute on `ExtractorResult` or a separate `bugs: tuple[str, ...]` field would be more rigorous; the prefix is the v0.1-pragmatic choice.
-- 🔄 **Reconsider the warning-vs-error split** if a consumer wants to render unsupported-format files differently from corrupt-block failures. Currently both are errors; the type isn't distinguished beyond message content.
+- 🔄 **Extend `is_known_image_format()`** when a user reports a niche image format being mis-classified as non-image. Append a magic-byte signature to the helper.

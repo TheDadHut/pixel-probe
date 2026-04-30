@@ -81,26 +81,29 @@ def test_handles_corrupt_block() -> None:
     assert result.warnings == ()
 
 
-def test_non_jpeg_returns_error() -> None:
-    """PNG → IPTC v0.1 returns ``data=None`` + one error per ADR 0011.
-    IPTC produces zero data on non-JPEG input — that's a failure, not a
-    warning. The error string makes the unsupported-format reason
-    visible to consumers."""
+def test_image_but_not_jpeg_returns_warning() -> None:
+    """PNG → IPTC v0.1 returns ``data={}`` + one warning per ADR 0011's
+    three-tier classification. PNG is a recognized image format that
+    IPTC just doesn't handle; that's a per-extractor format gap, not a
+    user error. Warning severity keeps batch runs over mixed JPEG/PNG
+    directories from drowning in false-alarm errors."""
     result = IptcExtractor().extract(fixture_path("tiny.png"))
 
-    assert result.data is None
-    assert result.warnings == ()
-    assert result.errors == ("File is not a JPEG; IPTC v0.1 supports JPEG only",)
+    assert result.data == {}
+    assert result.errors == ()
+    assert result.warnings == ("IPTC unavailable on this format; v0.1 supports JPEG only",)
 
 
-def test_text_file_returns_error() -> None:
-    """Same contract for non-image files — caller chose to point us at a
-    non-JPEG, IPTC produces zero data, so per ADR 0011: ``data=None`` +
-    error (not warning)."""
+def test_non_image_file_returns_error() -> None:
+    """Non-image inputs (text file, etc.) return ``data=None`` + one
+    error per ADR 0011. The user pointed pixel-probe at something that
+    isn't an image — that's a real failure, distinct from "image, just
+    not a format this extractor handles" (which is a warning)."""
     result = IptcExtractor().extract(fixture_path("not_an_image.txt"))
 
     assert result.data is None
-    assert result.errors == ("File is not a JPEG; IPTC v0.1 supports JPEG only",)
+    assert result.warnings == ()
+    assert result.errors == ("File is not a recognized image format; IPTC requires JPEG",)
 
 
 def test_missing_file_raises_typed_error(tmp_path: Path) -> None:

@@ -139,17 +139,34 @@ def test_png_path_parses_xmp() -> None:
     assert result.data["dc"]["title"] == "PNG XMP Title"
 
 
-def test_unsupported_format_returns_error() -> None:
-    """A non-JPEG / non-PNG file (plain text fixture) returns ``data=None``
-    + one error per ADR 0011. XMP produces zero data for unsupported host
-    formats — that's a failure, not a warning. TIFF support and other
-    host formats are out of scope for v0.1; the error makes that visible
-    to the caller."""
+def test_non_image_file_returns_error() -> None:
+    """A non-image file (plain text fixture) returns ``data=None`` + one
+    error per ADR 0011's three-tier classification. The user pointed
+    pixel-probe at something that isn't an image — distinct from
+    "image, just not a format XMP handles" (warning, see below)."""
     result = XmpExtractor().extract(fixture_path("not_an_image.txt"))
 
     assert result.data is None
     assert result.warnings == ()
-    assert result.errors == ("File is not a JPEG or PNG; XMP v0.1 supports JPEG/PNG only",)
+    assert result.errors == ("File is not a recognized image format; XMP requires JPEG or PNG",)
+
+
+def test_image_but_not_jpeg_or_png_returns_warning(tmp_path: Path) -> None:
+    """An image format XMP doesn't handle (TIFF, GIF, BMP, WebP) returns
+    ``data={}`` + one warning per ADR 0011. Format-specific gap, not a
+    user error — running pixel-probe across a mixed directory shouldn't
+    drown the user in false-alarm errors for every TIFF that lacks XMP.
+
+    Constructed inline via a minimal TIFF magic-byte prefix so we don't
+    need a real TIFF fixture (the signature check fires on prefix; the
+    rest of the file isn't inspected on this code path)."""
+    out = tmp_path / "fake.tiff"
+    out.write_bytes(b"II*\x00" + b"\x00" * 32)  # TIFF little-endian magic + padding
+    result = XmpExtractor().extract(out)
+
+    assert result.data == {}
+    assert result.errors == ()
+    assert result.warnings == ("XMP unavailable on this format; v0.1 supports JPEG and PNG only",)
 
 
 def test_missing_file_raises_typed_error(tmp_path: Path) -> None:
