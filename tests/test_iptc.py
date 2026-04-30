@@ -538,6 +538,8 @@ def test_file_too_large_raises_typed_error(tmp_path: Path, monkeypatch: pytest.M
     before any read begins. Same boundary contract as
     :class:`FileInfoExtractor` (we share the constant) — the orchestrator
     converts the raise into an error-only result downstream."""
+    import stat as stat_mod
+
     from pixel_probe.core.extractors import iptc as iptc_module
     from pixel_probe.exceptions import FileTooLargeError
 
@@ -548,6 +550,11 @@ def test_file_too_large_raises_typed_error(tmp_path: Path, monkeypatch: pytest.M
     real_stat = Path.stat
 
     class _StatStub:
+        # st_mode must signal "regular file" — Python 3.11's Path.is_file()
+        # reads st_mode and checks S_ISREG. Without this, is_file() raises
+        # AttributeError on the missing attribute (3.14 changed the lookup
+        # path so the attribute miss never surfaces there).
+        st_mode = stat_mod.S_IFREG | 0o644
         st_size = fake_size
         st_mtime = 0.0
 
