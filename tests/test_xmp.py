@@ -713,6 +713,8 @@ def test_file_too_large_raises_typed_error(tmp_path: Path, monkeypatch: pytest.M
     """Files past :data:`MAX_FILE_SIZE_BYTES` raise :class:`FileTooLargeError`
     before any read begins. Same boundary contract as
     :class:`FileInfoExtractor`."""
+    import stat as stat_mod
+
     from pixel_probe.core.extractors import xmp as xmp_module
     from pixel_probe.exceptions import FileTooLargeError
 
@@ -723,6 +725,11 @@ def test_file_too_large_raises_typed_error(tmp_path: Path, monkeypatch: pytest.M
     real_stat = Path.stat
 
     class _StatStub:
+        # st_mode must signal "regular file" — Python 3.11's Path.is_file()
+        # reads st_mode and checks S_ISREG. Without this, is_file() raises
+        # AttributeError on the missing attribute (3.14 changed the lookup
+        # path so the attribute miss never surfaces there).
+        st_mode = stat_mod.S_IFREG | 0o644
         st_size = fake_size
         st_mtime = 0.0
 
