@@ -5,17 +5,22 @@ is a :class:`PixelProbeError` subclass so callers can ``except PixelProbeError``
 to filter the project's errors from third-party noise. See ADR 0003 and the
 "Error model" section of :class:`pixel_probe.core.extractors.base.ExtractorResult`
 for the broader contract.
+
+The four named subclasses cover catastrophic, file-level failures that
+extractors raise out of :meth:`Extractor.extract`. Partial-extraction
+issues (e.g., malformed metadata block, unsupported per-extractor format)
+are surfaced as ``errors`` / ``warnings`` on the
+:class:`~pixel_probe.core.extractors.base.ExtractorResult` envelope rather
+than raised — see ADR 0003's error model and ADR 0006 for the rationale.
 """
 
 from __future__ import annotations
 
 __all__ = [
-    "CorruptMetadataError",
     "DecompressionBombError",
     "FileTooLargeError",
     "MissingFileError",
     "PixelProbeError",
-    "UnsupportedFormatError",
 ]
 
 
@@ -28,22 +33,6 @@ class MissingFileError(PixelProbeError):
 
     Kept inside the :class:`PixelProbeError` hierarchy so a single
     ``except PixelProbeError`` clause catches all extractor-side failures.
-    """
-
-
-class UnsupportedFormatError(PixelProbeError):
-    """Raised when an extractor doesn't support the given file format.
-
-    Example: the IPTC parser receiving a PNG (it's JPEG-only in v0.1).
-    """
-
-
-class CorruptMetadataError(PixelProbeError):
-    """Raised when a metadata block exists but cannot be parsed.
-
-    Example: a truncated EXIF IFD, malformed XMP packet, or out-of-bounds
-    IPTC record size. The file itself may still be a valid image; only
-    the metadata block is corrupt.
     """
 
 

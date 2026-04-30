@@ -4,6 +4,12 @@
 
 Accepted (2026-04-28).
 
+> **Revised by [ADR 0012](0012-reduced-exception-hierarchy.md) (2026-04-30):**
+> after Phase 3 review, `CorruptMetadataError` and `UnsupportedFormatError`
+> were removed from the implementation — both turned out architecturally
+> unraisable given ADR 0003's error model. This ADR is preserved as the
+> Phase 1 snapshot; ADR 0012 captures the post-Phase-3 reduced hierarchy.
+
 ## Context
 
 Extractors hit several distinct catastrophic failure modes:

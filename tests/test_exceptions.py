@@ -5,12 +5,10 @@ from __future__ import annotations
 import pytest
 
 from pixel_probe.exceptions import (
-    CorruptMetadataError,
     DecompressionBombError,
     FileTooLargeError,
     MissingFileError,
     PixelProbeError,
-    UnsupportedFormatError,
 )
 
 
@@ -23,8 +21,6 @@ def test_all_subclasses_inherit_from_pixel_probe_error() -> None:
     catch the family with one ``except`` clause."""
     for cls in (
         MissingFileError,
-        UnsupportedFormatError,
-        CorruptMetadataError,
         FileTooLargeError,
         DecompressionBombError,
     ):
@@ -32,14 +28,21 @@ def test_all_subclasses_inherit_from_pixel_probe_error() -> None:
 
 
 def test_subclasses_are_distinct() -> None:
-    """Catching one subclass mustn't catch siblings."""
-    try:
-        raise FileTooLargeError("test")
-    except DecompressionBombError:
-        msg = "FileTooLargeError caught as DecompressionBombError — siblings collide"
-        raise AssertionError(msg) from None
-    except FileTooLargeError:
-        pass
+    """Catching one subclass mustn't catch siblings — pairwise check across
+    all three concrete subclasses. If a future class inherits from another
+    by mistake (transitive subclass relationship), this test catches it."""
+    siblings = (MissingFileError, FileTooLargeError, DecompressionBombError)
+    for raised_cls in siblings:
+        for catch_cls in siblings:
+            if raised_cls is catch_cls:
+                continue
+            try:
+                raise raised_cls("test")
+            except catch_cls:
+                msg = f"{raised_cls.__name__} was caught as {catch_cls.__name__} — siblings collide"
+                raise AssertionError(msg) from None
+            except raised_cls:
+                pass
 
 
 def test_chained_exceptions_preserve_cause() -> None:

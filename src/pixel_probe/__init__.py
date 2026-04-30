@@ -12,12 +12,10 @@ from .core.extractors import (
     FileInfoExtractor,
 )
 from .exceptions import (
-    CorruptMetadataError,
     DecompressionBombError,
     FileTooLargeError,
     MissingFileError,
     PixelProbeError,
-    UnsupportedFormatError,
 )
 
 try:
@@ -28,7 +26,6 @@ except PackageNotFoundError:  # pragma: no cover — only hit when running unins
 __all__ = [
     "AnalysisResult",
     "Analyzer",
-    "CorruptMetadataError",
     "DecompressionBombError",
     "ExifData",
     "ExifExtractor",
@@ -39,6 +36,5 @@ __all__ = [
     "FileTooLargeError",
     "MissingFileError",
     "PixelProbeError",
-    "UnsupportedFormatError",
     "__version__",
 ]
