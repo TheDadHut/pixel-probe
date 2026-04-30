@@ -19,6 +19,7 @@ from .extractors.base import Extractor, ExtractorResult
 from .extractors.exif import ExifExtractor
 from .extractors.file_info import FileInfoExtractor
 from .extractors.iptc import IptcExtractor
+from .extractors.xmp import XmpExtractor
 
 __all__ = [
     "AnalysisResult",
@@ -65,11 +66,11 @@ class Analyzer:
     def default(cls) -> Analyzer:
         """Return an :class:`Analyzer` configured with the built-in extractors.
 
-        v0.1: file_info + EXIF + IPTC. Phase 3b adds XMP — it lands here.
-        Order matters for downstream rendering (CLI / GUI tree both display
-        in declared order); file-level metadata first, then format-specific.
+        v0.1: file_info + EXIF + IPTC + XMP. Order matters for downstream
+        rendering (CLI / GUI tree both display in declared order);
+        file-level metadata first, then format-specific.
         """
-        return cls([FileInfoExtractor(), ExifExtractor(), IptcExtractor()])
+        return cls([FileInfoExtractor(), ExifExtractor(), IptcExtractor(), XmpExtractor()])
 
     def analyze(self, path: Path) -> AnalysisResult:
         """Run every extractor against ``path``; return the aggregate.

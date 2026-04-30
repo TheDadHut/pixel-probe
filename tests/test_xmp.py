@@ -1,0 +1,737 @@
+"""XMP extractor tests — RDF flattening, host-format dispatch, XXE security gate.
+
+The XXE test (:func:`test_xxe_payload_blocked`) is the load-bearing one for
+portfolio signal: it confirms that ``defusedxml`` actually rejects the XXE
+payload we feed it. If this test ever passes by silently resolving the
+external entity, the security guarantee in ADR 0003 is broken — that's
+the regression we want to catch.
+"""
+
+from __future__ import annotations
+
+import struct
+import zlib
+from pathlib import Path
+
+import pytest
+
+# defusedxml.fromstring is identical to xml.etree.ElementTree.fromstring for
+# safe inputs; using it in tests avoids ruff's S314 (untrusted-XML) lint rule
+# while keeping the assertions identical. The literal XML strings here are
+# obviously safe — but the rule fires uniformly, and the safer call is free.
+from defusedxml.ElementTree import fromstring
+
+from pixel_probe.core.analyzer import Analyzer
+from pixel_probe.core.extractors.xmp import (
+    XmpExtractor,
+    _find_xmp_packet,
+    _find_xmp_packet_jpeg,
+    _find_xmp_packet_png,
+    _flatten_value,
+    _flatten_xmp,
+    _has_extended_xmp,
+    _pick_alt_lang,
+    _read_itxt_xmp,
+    _strip_namespace,
+)
+from pixel_probe.exceptions import MissingFileError
+
+from .conftest import fixture_path
+
+# ---------------------------------------------------------------------------
+# Integration: real fixtures
+# ---------------------------------------------------------------------------
+
+
+def test_parses_dc_title_alt() -> None:
+    """``dc:title`` is encoded as ``<rdf:Alt>`` with language alternatives.
+    The flattener picks ``x-default`` and surfaces it as a plain string."""
+    result = XmpExtractor().extract(fixture_path("xmp_basic.jpg"))
+
+    assert result.extractor_name == "xmp"
+    assert result.errors == ()
+    assert result.warnings == ()
+    assert result.has_data
+    assert result.data["dc"]["title"] == "XMP Sample Title"
+
+
+def test_keywords_as_list_from_rdf_bag() -> None:
+    """``dc:subject`` (Bag of li elements) flattens to ``list[str]`` in
+    document order — the load-bearing repeatable-property contract."""
+    result = XmpExtractor().extract(fixture_path("xmp_basic.jpg"))
+
+    assert result.data["dc"]["subject"] == ["nature", "landscape", "sample"]
+
+
+def test_creator_as_list_from_rdf_seq() -> None:
+    """``rdf:Seq`` flattens to a list the same way ``rdf:Bag`` does — Seq
+    semantics imply order, but at the storage layer we treat them
+    identically (list preserves order anyway)."""
+    result = XmpExtractor().extract(fixture_path("xmp_basic.jpg"))
+
+    assert result.data["dc"]["creator"] == ["Alice Author"]
+
+
+def test_simple_text_properties() -> None:
+    """``xmp:CreatorTool`` and ``photoshop:Headline`` are simple text —
+    surfaced as scalar strings under their friendly prefix."""
+    result = XmpExtractor().extract(fixture_path("xmp_basic.jpg"))
+
+    assert result.data["xmp"]["CreatorTool"] == "pixel-probe-fixtures"
+    assert result.data["photoshop"]["Headline"] == "Sample headline"
+
+
+def test_unknown_namespace_silently_dropped() -> None:
+    """Properties from namespaces not in :data:`_NAMESPACE_PREFIXES` are
+    dropped — the fixture deliberately includes a ``vendor:OutOfScope``
+    element to verify this. No warning, no error: the property was simply
+    ignored."""
+    result = XmpExtractor().extract(fixture_path("xmp_basic.jpg"))
+
+    assert "vendor" not in result.data
+    # Walk every value to confirm the marker text isn't smuggled in
+    # under any other namespace.
+    for ns_data in result.data.values():
+        for value in ns_data.values():
+            assert "should be dropped" not in (value if isinstance(value, str) else " ".join(value))
+
+
+def test_returns_empty_for_image_without_xmp() -> None:
+    """No XMP packet in the host file → empty data, no errors, no warnings.
+    This is the normal case for un-tagged images."""
+    result = XmpExtractor().extract(fixture_path("xmp_none.jpg"))
+
+    assert result.data == {}
+    assert result.errors == ()
+    assert result.warnings == ()
+    assert not result.has_data
+
+
+def test_malformed_xml_returns_error_not_crash() -> None:
+    """A truncated XMP packet must surface a single error string and not
+    propagate the :class:`xml.etree.ElementTree.ParseError` out — the
+    boundary contract for partial-failure parses."""
+    result = XmpExtractor().extract(fixture_path("xmp_malformed.jpg"))
+
+    assert result.data == {}
+    assert len(result.errors) == 1
+    assert "ParseError" in result.errors[0] or "parse error" in result.errors[0].lower()
+
+
+def test_png_path_parses_xmp() -> None:
+    """End-to-end PNG dispatch: a PNG with an iTXt chunk carrying XMP is
+    parsed identically to the JPEG path. Validates the per-format
+    dispatch in :func:`_find_xmp_packet`."""
+    result = XmpExtractor().extract(fixture_path("xmp_basic.png"))
+
+    assert result.errors == ()
+    assert result.data["dc"]["title"] == "PNG XMP Title"
+
+
+def test_unsupported_format_warns_returns_empty() -> None:
+    """A non-JPEG / non-PNG file (plain text fixture) returns empty +
+    one warning. TIFF support and other host formats are out of scope
+    for v0.1; the warning makes that visible to the caller."""
+    result = XmpExtractor().extract(fixture_path("not_an_image.txt"))
+
+    assert result.data == {}
+    assert result.warnings == ("File is not a JPEG or PNG; XMP v0.1 supports JPEG/PNG only",)
+
+
+def test_missing_file_raises_typed_error(tmp_path: Path) -> None:
+    """Same boundary contract as the other extractors: missing input is a
+    :class:`MissingFileError` (a :class:`PixelProbeError` subclass)."""
+    with pytest.raises(MissingFileError):
+        XmpExtractor().extract(tmp_path / "does-not-exist.jpg")
+
+
+def test_idempotent() -> None:
+    """Same input → same output, every call. Pure I/O, no global state."""
+    extractor = XmpExtractor()
+    a = extractor.extract(fixture_path("xmp_basic.jpg"))
+    b = extractor.extract(fixture_path("xmp_basic.jpg"))
+    assert a.data == b.data
+    assert a.errors == b.errors
+
+
+def test_wired_into_default_analyzer() -> None:
+    """The default factory must include XMP — end-to-end smoke that the
+    extractor is reachable through the public ``Analyzer.default()`` API."""
+    result = Analyzer.default().analyze(fixture_path("xmp_basic.jpg"))
+
+    assert "xmp" in result.results
+    assert result.results["xmp"].has_data
+    assert result.results["xmp"].data["dc"]["title"] == "XMP Sample Title"
+
+
+# ---------------------------------------------------------------------------
+# Security: XXE / DTD rejection (load-bearing portfolio signal)
+# ---------------------------------------------------------------------------
+
+
+def test_xxe_payload_blocked(tmp_path: Path) -> None:
+    """The flagship security test: an XMP packet carrying an XXE attack
+    (external entity reference to a local file) must be rejected by
+    :mod:`defusedxml` *before* any entity resolution. The result is an
+    error string surfacing the security exception; no file contents
+    leak into the parse output.
+
+    If this test ever passes by silently resolving the entity (e.g. if
+    someone swaps :func:`defusedxml.ElementTree.fromstring` for the
+    stdlib version), it'll either contain leaked file contents or fail
+    in a different way — the assertions here pin both the rejection
+    *and* the no-leak property.
+    """
+    secret_target = tmp_path / "secret.txt"
+    secret_target.write_text("SECRET_DATA_THAT_MUST_NOT_LEAK")
+
+    xxe_packet = (
+        b'<?xml version="1.0"?>'
+        b"<!DOCTYPE foo ["
+        b'  <!ENTITY xxe SYSTEM "file://' + bytes(str(secret_target), "utf-8") + b'">'
+        b"]>"
+        b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        b'<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        b"<dc:title>&xxe;</dc:title>"
+        b"</rdf:Description>"
+        b"</rdf:RDF>"
+        b"</x:xmpmeta>"
+    )
+    payload = b"http://ns.adobe.com/xap/1.0/\x00" + xxe_packet
+    length = len(payload) + 2
+    app1 = b"\xff\xe1" + length.to_bytes(2, "big") + payload
+    # Minimum-viable JPEG: SOI + APP1 + EOI. Real decoders won't decode it
+    # to pixels, but our parser only walks segments.
+    out = tmp_path / "xxe.jpg"
+    out.write_bytes(b"\xff\xd8" + app1 + b"\xff\xd9")
+
+    result = XmpExtractor().extract(out)
+
+    # Security gate: defusedxml rejected the parse. data is empty.
+    assert result.data == {}
+    assert len(result.errors) == 1
+    assert "security" in result.errors[0].lower()
+
+    # No-leak property: the file contents must not appear anywhere on the
+    # result envelope. This is what fails loudest if the security guarantee
+    # ever breaks.
+    leak_marker = "SECRET_DATA_THAT_MUST_NOT_LEAK"
+    assert leak_marker not in result.errors[0]
+    for value in (result.warnings, result.errors):
+        assert leak_marker not in repr(value)
+
+
+def test_extended_xmp_warns(tmp_path: Path) -> None:
+    """A file marked with ``xmpNote:HasExtendedXMP`` produces a warning
+    (extended packets are out of scope for v1; we parse the main packet
+    only)."""
+    packet = (
+        b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        b'<rdf:Description rdf:about=""'
+        b'  xmlns:xmpNote="http://ns.adobe.com/xmp/note/"'
+        b'  xmpNote:HasExtendedXMP="abc123" />'
+        b"</rdf:RDF>"
+        b"</x:xmpmeta>"
+    )
+    full_payload = b"http://ns.adobe.com/xap/1.0/\x00" + packet
+    length = len(full_payload) + 2
+    app1 = b"\xff\xe1" + length.to_bytes(2, "big") + full_payload
+    out = tmp_path / "ext.jpg"
+    out.write_bytes(b"\xff\xd8" + app1 + b"\xff\xd9")
+
+    result = XmpExtractor().extract(out)
+
+    assert any("Extended XMP" in w for w in result.warnings)
+
+
+# ---------------------------------------------------------------------------
+# Helper unit tests — _strip_namespace
+# ---------------------------------------------------------------------------
+
+
+def test_strip_namespace_qualified() -> None:
+    """``{uri}local`` form splits into ``(uri, local)``."""
+    assert _strip_namespace("{http://example.com/}foo") == ("http://example.com/", "foo")
+
+
+def test_strip_namespace_unqualified() -> None:
+    """A bare local name has no URI."""
+    assert _strip_namespace("foo") == (None, "foo")
+
+
+def test_strip_namespace_malformed_brace() -> None:
+    """A leading ``{`` without a closing ``}`` is treated as a literal name —
+    don't crash, don't try to invent a namespace."""
+    assert _strip_namespace("{noend") == (None, "{noend")
+
+
+# ---------------------------------------------------------------------------
+# Helper unit tests — _flatten_value / _pick_alt_lang
+# ---------------------------------------------------------------------------
+
+
+def test_flatten_value_simple_text() -> None:
+    """A property with no children flattens to its text content (stripped)."""
+    elem = fromstring("<x>  hello  </x>")
+    assert _flatten_value(elem) == "hello"
+
+
+def test_flatten_value_simple_text_empty() -> None:
+    """An empty-text element flattens to the empty string."""
+    elem = fromstring("<x />")
+    assert _flatten_value(elem) == ""
+
+
+def test_flatten_value_bag_to_list() -> None:
+    """``rdf:Bag`` of ``rdf:li`` flattens to ``list[str]`` in document order."""
+    xml = (
+        '<root xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        "<rdf:Bag><rdf:li>a</rdf:li><rdf:li>b</rdf:li></rdf:Bag>"
+        "</root>"
+    )
+    elem = fromstring(xml)
+    assert _flatten_value(elem) == ["a", "b"]
+
+
+def test_flatten_value_seq_to_list() -> None:
+    """``rdf:Seq`` follows the same shape as Bag — both flatten to a list
+    (Seq's order semantics are preserved naturally)."""
+    xml = (
+        '<root xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        "<rdf:Seq><rdf:li>first</rdf:li><rdf:li>second</rdf:li></rdf:Seq>"
+        "</root>"
+    )
+    elem = fromstring(xml)
+    assert _flatten_value(elem) == ["first", "second"]
+
+
+def test_flatten_value_alt_picks_x_default() -> None:
+    """``rdf:Alt`` with an ``xml:lang="x-default"`` entry picks that one,
+    not the first."""
+    xml = (
+        '<root xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        "<rdf:Alt>"
+        '<rdf:li xml:lang="fr">French first</rdf:li>'
+        '<rdf:li xml:lang="x-default">Default</rdf:li>'
+        "</rdf:Alt>"
+        "</root>"
+    )
+    elem = fromstring(xml)
+    assert _flatten_value(elem) == "Default"
+
+
+def test_flatten_value_alt_falls_back_to_first_when_no_default() -> None:
+    """``rdf:Alt`` without an ``x-default`` entry falls back to the first
+    ``<rdf:li>``."""
+    xml = (
+        '<root xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        "<rdf:Alt>"
+        '<rdf:li xml:lang="fr">First lang</rdf:li>'
+        '<rdf:li xml:lang="de">Second lang</rdf:li>'
+        "</rdf:Alt>"
+        "</root>"
+    )
+    elem = fromstring(xml)
+    assert _flatten_value(elem) == "First lang"
+
+
+def test_pick_alt_lang_empty_alt_returns_empty() -> None:
+    """A degenerate ``rdf:Alt`` with no ``rdf:li`` children returns the
+    empty string — caller still gets a string, not None."""
+    xml = '<rdf:Alt xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/>'
+    elem = fromstring(xml)
+    assert _pick_alt_lang(elem) == ""
+
+
+def test_pick_alt_lang_first_li_with_no_text() -> None:
+    """A first-fallback ``<rdf:li>`` with no text content returns empty
+    string, not None — same string-only contract."""
+    xml = (
+        '<rdf:Alt xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:li xml:lang="fr"></rdf:li>'
+        "</rdf:Alt>"
+    )
+    elem = fromstring(xml)
+    assert _pick_alt_lang(elem) == ""
+
+
+def test_flatten_value_two_children_treated_as_simple() -> None:
+    """A property with multiple non-container children doesn't match any
+    of the structured-value rules — falls through to text-content extraction."""
+    xml = "<x>some text<a/><b/></x>"
+    elem = fromstring(xml)
+    # Two children → not Bag/Seq/Alt; flatten to (text or empty).
+    assert _flatten_value(elem) == "some text"
+
+
+def test_flatten_value_single_non_container_child_falls_through_to_text() -> None:
+    """A property with exactly one child that's *not* Bag/Seq/Alt falls
+    through both structured-value rules (line 240's ``if`` and the Bag/Seq
+    ``if`` above it) and lands on the text-content fallback. Covers the
+    branch from the Alt check straight to the simple-text return."""
+    xml = "<x>parent text<nested>child text</nested></x>"
+    elem = fromstring(xml)
+    # The single child isn't an RDF container — flattens to parent's text.
+    assert _flatten_value(elem) == "parent text"
+
+
+# ---------------------------------------------------------------------------
+# Helper unit tests — _flatten_xmp
+# ---------------------------------------------------------------------------
+
+
+def test_flatten_xmp_attributes_on_description() -> None:
+    """Attribute-form properties on ``<rdf:Description>`` (e.g.
+    ``<rdf:Description dc:title="foo"/>``) are surfaced the same as
+    element-form properties."""
+    xml = (
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about=""'
+        '  xmlns:dc="http://purl.org/dc/elements/1.1/"'
+        '  dc:title="Attribute form" />'
+        "</rdf:RDF>"
+        "</x:xmpmeta>"
+    )
+    root = fromstring(xml)
+    data = _flatten_xmp(root)
+    assert data == {"dc": {"title": "Attribute form"}}
+
+
+def test_flatten_xmp_bare_rdf_root_works() -> None:
+    """An XMP packet that's just ``<rdf:RDF>`` directly (without the outer
+    ``<x:xmpmeta>`` wrapper) still flattens. Some encoders skip the
+    wrapper; we shouldn't be picky."""
+    xml = (
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about=""'
+        '  xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        "<dc:title>Bare RDF</dc:title>"
+        "</rdf:Description>"
+        "</rdf:RDF>"
+    )
+    root = fromstring(xml)
+    assert _flatten_xmp(root) == {"dc": {"title": "Bare RDF"}}
+
+
+def test_flatten_xmp_no_rdf_root_returns_empty() -> None:
+    """A tree with neither ``rdf:RDF`` nor a top-level ``rdf:RDF`` child
+    yields empty data — defensive for malformed-but-parseable XML."""
+    xml = "<root><meta>no rdf here</meta></root>"
+    root = fromstring(xml)
+    assert _flatten_xmp(root) == {}
+
+
+def test_flatten_xmp_unknown_attribute_namespace_dropped() -> None:
+    """An attribute from a vendor namespace not in our prefix map is
+    silently dropped. Parity with the element-side behavior."""
+    xml = (
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about=""'
+        '  xmlns:dc="http://purl.org/dc/elements/1.1/"'
+        '  xmlns:vendor="http://example.com/vendor/1.0/"'
+        '  dc:title="Real title"'
+        '  vendor:OutOfScope="ignored" />'
+        "</rdf:RDF>"
+    )
+    root = fromstring(xml)
+    data = _flatten_xmp(root)
+    assert data == {"dc": {"title": "Real title"}}
+
+
+# ---------------------------------------------------------------------------
+# Helper unit tests — _find_xmp_packet (host-format dispatch)
+# ---------------------------------------------------------------------------
+
+
+def test_find_xmp_packet_unknown_format_returns_none() -> None:
+    """Bytes that match neither JPEG SOI nor the PNG signature → None."""
+    assert _find_xmp_packet(b"GIF89a...some random bytes") is None
+    assert _find_xmp_packet(b"") is None
+
+
+def test_find_xmp_packet_jpeg_no_xmp_returns_none() -> None:
+    """A JPEG with no XMP segment → None (not an error, just absent)."""
+    jpeg = b"\xff\xd8" + b"\xff\xd9"  # SOI + EOI, no segments
+    assert _find_xmp_packet_jpeg(jpeg) is None
+
+
+def test_find_xmp_packet_jpeg_handles_truncated_length() -> None:
+    """A truncated APP segment doesn't crash the JPEG packet finder."""
+    truncated = b"\xff\xd8\xff\xe1" + (9999).to_bytes(2, "big") + b"abc"
+    assert _find_xmp_packet_jpeg(truncated) is None
+
+
+def test_find_xmp_packet_jpeg_skips_standalone_markers() -> None:
+    """Restart markers (``RST0..RST7``) appear with no length payload —
+    walker advances by 2 bytes without yielding."""
+    # SOI + RST0 + APP1(XMP) + EOI, where APP1 carries a real XMP packet.
+    minimal_xmp = (
+        b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" />'
+        b"</x:xmpmeta>"
+    )
+    sig_and_packet = b"http://ns.adobe.com/xap/1.0/\x00" + minimal_xmp
+    length = len(sig_and_packet) + 2
+    jpeg = (
+        b"\xff\xd8"
+        + b"\xff\xd0"  # RST0 — standalone, no length
+        + b"\xff\xe1"
+        + length.to_bytes(2, "big")
+        + sig_and_packet
+        + b"\xff\xd9"
+    )
+    assert _find_xmp_packet_jpeg(jpeg) == minimal_xmp
+
+
+def test_find_xmp_packet_jpeg_skips_padding_fill_bytes() -> None:
+    """Some encoders emit ``0xFF`` fill bytes between segments. The walker
+    advances past them by one byte at a time."""
+    minimal_xmp = b'<x:xmpmeta xmlns:x="adobe:ns:meta/" />'
+    sig_and_packet = b"http://ns.adobe.com/xap/1.0/\x00" + minimal_xmp
+    length = len(sig_and_packet) + 2
+    jpeg = (
+        b"\xff\xd8"
+        + b"\xff\xff\xff"  # padding fill bytes
+        + b"\xe1"
+        + length.to_bytes(2, "big")
+        + sig_and_packet
+        + b"\xff\xd9"
+    )
+    assert _find_xmp_packet_jpeg(jpeg) == minimal_xmp
+
+
+def test_find_xmp_packet_jpeg_stops_on_invalid_marker_prefix() -> None:
+    """A byte where ``0xFF`` should be but isn't terminates the walk —
+    malformed JPEG."""
+    jpeg = b"\xff\xd8\x00\xe1\x00\x05hello"
+    assert _find_xmp_packet_jpeg(jpeg) is None
+
+
+def test_find_xmp_packet_jpeg_stops_at_sos() -> None:
+    """``SOS`` introduces entropy-coded data — walker stops before reading
+    past it. An XMP-shaped payload after SOS must not be returned."""
+    jpeg = (
+        b"\xff\xd8"
+        + b"\xff\xda"  # SOS
+        # Past this point the walker must stop, even if a fake XMP packet follows
+        + b"\xff\xe1\x00\x05"
+        + b"http://ns.adobe.com/xap/1.0/\x00"
+    )
+    assert _find_xmp_packet_jpeg(jpeg) is None
+
+
+def test_find_xmp_packet_jpeg_stops_on_short_length_field() -> None:
+    """A length field smaller than 2 (its own size) is malformed."""
+    jpeg = b"\xff\xd8\xff\xe1\x00\x01\xff\xd9"
+    assert _find_xmp_packet_jpeg(jpeg) is None
+
+
+def test_find_xmp_packet_jpeg_ignores_non_xmp_app1() -> None:
+    """An APP1 segment whose payload doesn't begin with the XMP signature
+    is skipped (typical case: APP1 carrying EXIF). Walker continues to
+    the next segment."""
+    exif_payload = b"Exif\x00\x00fakeexif"
+    length = len(exif_payload) + 2
+    jpeg = b"\xff\xd8" + b"\xff\xe1" + length.to_bytes(2, "big") + exif_payload + b"\xff\xd9"
+    assert _find_xmp_packet_jpeg(jpeg) is None
+
+
+def test_find_xmp_packet_jpeg_truncated_length_field() -> None:
+    """A segment marker followed by fewer than 2 bytes (the length field's
+    own size) hits the ``offset + 4 > n`` guard. Without that guard, we'd
+    read past end-of-buffer constructing the length integer."""
+    jpeg = b"\xff\xd8\xff\xe1\x00"  # marker present, only 1 length byte
+    assert _find_xmp_packet_jpeg(jpeg) is None
+
+
+def test_find_xmp_packet_jpeg_loop_exhausts_without_xmp() -> None:
+    """A buffer that walks through one or more non-XMP segments and ends
+    cleanly at the buffer boundary (no SOS, no EOI) reaches the natural
+    end-of-loop and returns None — exercises the post-loop fall-through
+    rather than any of the early returns."""
+    # SOI + APP0 (JFIF-shaped, non-XMP) consuming the rest of the buffer.
+    jfif_payload = b"JFIF\x00fakeheader"
+    length = len(jfif_payload) + 2
+    # Build the buffer so that after processing APP0, offset advances exactly
+    # to len(buffer) — the loop's `while offset + 1 < n` condition then exits
+    # without re-entering, and we hit the post-loop `return None`.
+    jpeg = b"\xff\xd8\xff\xe0" + length.to_bytes(2, "big") + jfif_payload
+    assert _find_xmp_packet_jpeg(jpeg) is None
+
+
+def test_find_xmp_packet_png_chunk_data_overruns_buffer() -> None:
+    """A PNG chunk whose declared data length walks past end-of-buffer
+    (with room for the chunk header but not the data) hits the
+    ``data_end + 4 > n`` guard. Need a buffer at least 20 bytes so the
+    loop's ``offset + 12 <= n`` precondition lets us into the chunk
+    body — otherwise we'd never reach the inner guard."""
+    overrun = (
+        _PNG_SIGNATURE
+        + (9999).to_bytes(4, "big")  # declared length far exceeds remaining bytes
+        + b"abcd"  # any chunk type
+        + b"xxxx"  # 4 dummy bytes — enough to satisfy the outer 20-byte threshold
+    )
+    assert _find_xmp_packet_png(overrun) is None
+
+
+# ---------------------------------------------------------------------------
+# Helper unit tests — _find_xmp_packet_png and _read_itxt_xmp
+# ---------------------------------------------------------------------------
+
+
+def _build_png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    """Build a single PNG chunk (length + type + data + CRC). Test-side
+    duplicate of the script-side helper so tests stay independent of
+    ``scripts/``."""
+    return (
+        len(data).to_bytes(4, "big")
+        + chunk_type
+        + data
+        + struct.pack(">I", zlib.crc32(chunk_type + data))
+    )
+
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def test_find_xmp_packet_png_no_xmp_returns_none() -> None:
+    """A PNG with no XMP iTXt chunk → None."""
+    # Just the signature with no chunks (technically not a valid PNG, but
+    # the chunk walker doesn't care — it just returns None when no chunks
+    # remain).
+    assert _find_xmp_packet_png(_PNG_SIGNATURE) is None
+
+
+def test_find_xmp_packet_png_handles_truncated_chunk() -> None:
+    """A chunk header declaring more data than remains → None, no crash."""
+    truncated = _PNG_SIGNATURE + (9999).to_bytes(4, "big") + b"iTXt" + b"abc"
+    assert _find_xmp_packet_png(truncated) is None
+
+
+def test_find_xmp_packet_png_skips_compressed_xmp() -> None:
+    """An iTXt chunk with compression-flag=1 (compressed text) is skipped
+    rather than decompressed — keeping the dep graph zlib-free."""
+    # iTXt: keyword \0 compression-flag(1) compression-method(0) lang \0 tkw \0 text
+    compressed = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00<garbage compressed text>"
+    chunk = _build_png_chunk(b"iTXt", compressed)
+    png = _PNG_SIGNATURE + chunk
+    assert _find_xmp_packet_png(png) is None
+
+
+def test_find_xmp_packet_png_skips_non_xmp_itxt() -> None:
+    """An iTXt chunk whose keyword is not ``XML:com.adobe.xmp`` is skipped.
+    Other iTXt usages (e.g. arbitrary user metadata) shouldn't be confused
+    for XMP."""
+    payload = b"Author\x00\x00\x00\x00\x00Alice"
+    chunk = _build_png_chunk(b"iTXt", payload)
+    png = _PNG_SIGNATURE + chunk
+    assert _find_xmp_packet_png(png) is None
+
+
+def test_read_itxt_xmp_handles_missing_keyword_terminator() -> None:
+    """An iTXt payload with no NUL terminator after the keyword → None."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp_no_nul_here") is None
+
+
+def test_read_itxt_xmp_handles_truncated_after_keyword() -> None:
+    """An iTXt payload that ends before the compression flags fits → None."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00") is None
+
+
+def test_read_itxt_xmp_handles_missing_lang_terminator() -> None:
+    """An iTXt payload missing the language-tag NUL terminator → None."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00\x00\x00xx-no-end") is None
+
+
+def test_read_itxt_xmp_handles_missing_translated_keyword_terminator() -> None:
+    """An iTXt payload missing the translated-keyword NUL terminator → None."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00\x00\x00\x00no-end") is None
+
+
+# ---------------------------------------------------------------------------
+# Helper unit tests — _has_extended_xmp
+# ---------------------------------------------------------------------------
+
+
+def test_has_extended_xmp_attribute_form() -> None:
+    """The ``HasExtendedXMP`` marker is detected when present as an
+    attribute on ``<rdf:Description>``."""
+    xml = (
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about=""'
+        '  xmlns:xmpNote="http://ns.adobe.com/xmp/note/"'
+        '  xmpNote:HasExtendedXMP="abc" />'
+        "</rdf:RDF>"
+    )
+    root = fromstring(xml)
+    assert _has_extended_xmp(root) is True
+
+
+def test_has_extended_xmp_element_form() -> None:
+    """The marker is also detected when present as a child element."""
+    xml = (
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about=""'
+        '  xmlns:xmpNote="http://ns.adobe.com/xmp/note/">'
+        "<xmpNote:HasExtendedXMP>abc</xmpNote:HasExtendedXMP>"
+        "</rdf:Description>"
+        "</rdf:RDF>"
+    )
+    root = fromstring(xml)
+    assert _has_extended_xmp(root) is True
+
+
+def test_has_extended_xmp_absent() -> None:
+    """No marker → False, no false positives."""
+    xml = (
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about="" />'
+        "</rdf:RDF>"
+    )
+    root = fromstring(xml)
+    assert _has_extended_xmp(root) is False
+
+
+def test_has_extended_xmp_no_rdf_root_returns_false() -> None:
+    """A tree without an ``rdf:RDF`` element returns False — the marker
+    can only live inside RDF. Defensive against malformed-but-parseable
+    XMP-like trees."""
+    xml = "<root><just-noise /></root>"
+    root = fromstring(xml)
+    assert _has_extended_xmp(root) is False
+
+
+# ---------------------------------------------------------------------------
+# Misc invariants
+# ---------------------------------------------------------------------------
+
+
+def test_file_too_large_raises_typed_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Files past :data:`MAX_FILE_SIZE_BYTES` raise :class:`FileTooLargeError`
+    before any read begins. Same boundary contract as
+    :class:`FileInfoExtractor`."""
+    from pixel_probe.core.extractors import xmp as xmp_module
+    from pixel_probe.exceptions import FileTooLargeError
+
+    out = tmp_path / "small.jpg"
+    out.write_bytes(b"\xff\xd8\xff\xd9")
+
+    fake_size = xmp_module.MAX_FILE_SIZE_BYTES + 1
+    real_stat = Path.stat
+
+    class _StatStub:
+        st_size = fake_size
+        st_mtime = 0.0
+
+    def _fake_stat(self: Path, *, follow_symlinks: bool = True) -> _StatStub:
+        if self == out:
+            return _StatStub()
+        return real_stat(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", _fake_stat)
+
+    with pytest.raises(FileTooLargeError):
+        XmpExtractor().extract(out)

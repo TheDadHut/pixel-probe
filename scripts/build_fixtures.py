@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import struct
 import sys
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 
@@ -218,6 +220,161 @@ def _build_iptc_corrupt_jpeg(out: Path) -> None:
     out.write_bytes(_splice_after_soi(base, app13))
 
 
+# XMP fixture authoring ------------------------------------------------------
+#
+# XMP is XML wrapped in a host-format envelope: a JPEG APP1 segment with a
+# specific signature, or a PNG iTXt chunk with a specific keyword. Pillow
+# has no high-level XMP writer, so we hand-build the host-format wrapper
+# the same way the parser parses it. See
+# ``src/pixel_probe/core/extractors/xmp.py`` for the format reference
+# this mirrors.
+
+
+def _wrap_xmp_packet(rdf_body: str) -> bytes:
+    """Wrap an RDF body in the standard XMP packet envelope. The
+    ``W5M0MpCehiHzreSzNTczkc9d`` GUID in the begin instruction is a
+    well-known XMP marker that some toolchains key off of."""
+    packet = (
+        '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">\n'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
+        f"{rdf_body}\n"
+        "</rdf:RDF>\n"
+        "</x:xmpmeta>\n"
+        '<?xpacket end="w"?>'
+    )
+    return packet.encode("utf-8")
+
+
+def _build_app1_xmp_segment(packet: bytes) -> bytes:
+    """Build a JPEG APP1 segment carrying an XMP packet. The signature
+    ``http://ns.adobe.com/xap/1.0/\\0`` identifies the packet to parsers."""
+    payload = b"http://ns.adobe.com/xap/1.0/\x00" + packet
+    length = len(payload) + 2
+    if length > 0xFFFF:
+        msg = f"APP1 XMP segment too large for v1: {length} bytes"
+        raise ValueError(msg)
+    return b"\xff\xe1" + length.to_bytes(2, "big") + payload
+
+
+def _build_xmp_basic_jpeg(out: Path) -> None:
+    """100x100 JPEG with rich XMP exercising every flattening rule:
+
+    - ``dc:title`` as ``rdf:Alt`` → x-default lang
+    - ``dc:subject`` as ``rdf:Bag`` → list of keywords
+    - ``dc:creator`` as ``rdf:Seq`` → list (ordered)
+    - ``xmp:CreatorTool`` as simple text
+    - ``photoshop:Headline`` as simple text
+    - vendor-specific namespace that should be silently dropped
+    """
+    img = Image.new("RGB", (100, 100), color=(80, 130, 180))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80)
+    base = buf.getvalue()
+
+    rdf = """  <rdf:Description rdf:about=""
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
+    xmlns:vendor="http://example.com/vendor/1.0/">
+    <dc:title>
+      <rdf:Alt>
+        <rdf:li xml:lang="x-default">XMP Sample Title</rdf:li>
+        <rdf:li xml:lang="fr">Exemple XMP</rdf:li>
+      </rdf:Alt>
+    </dc:title>
+    <dc:subject>
+      <rdf:Bag>
+        <rdf:li>nature</rdf:li>
+        <rdf:li>landscape</rdf:li>
+        <rdf:li>sample</rdf:li>
+      </rdf:Bag>
+    </dc:subject>
+    <dc:creator>
+      <rdf:Seq>
+        <rdf:li>Alice Author</rdf:li>
+      </rdf:Seq>
+    </dc:creator>
+    <xmp:CreatorTool>pixel-probe-fixtures</xmp:CreatorTool>
+    <photoshop:Headline>Sample headline</photoshop:Headline>
+    <vendor:OutOfScope>should be dropped</vendor:OutOfScope>
+  </rdf:Description>"""
+
+    out.write_bytes(_splice_after_soi(base, _build_app1_xmp_segment(_wrap_xmp_packet(rdf))))
+
+
+def _build_xmp_none_jpeg(out: Path) -> None:
+    """100x100 JPEG without any XMP packet."""
+    img = Image.new("RGB", (100, 100), color=(180, 130, 80))
+    img.save(out, format="JPEG", quality=80)
+
+
+def _build_xmp_malformed_jpeg(out: Path) -> None:
+    """100x100 JPEG whose XMP packet is structurally broken (unclosed root
+    element). Drives the :class:`xml.etree.ElementTree.ParseError` path —
+    parser must surface a single error string and not crash."""
+    img = Image.new("RGB", (100, 100), color=(120, 80, 130))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80)
+    base = buf.getvalue()
+
+    bad = b'<x:xmpmeta xmlns:x="adobe:ns:meta/"><unclosed-tag>'
+    payload = b"http://ns.adobe.com/xap/1.0/\x00" + bad
+    length = len(payload) + 2
+    app1 = b"\xff\xe1" + length.to_bytes(2, "big") + payload
+    out.write_bytes(_splice_after_soi(base, app1))
+
+
+def _build_png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    """Build a single PNG chunk: ``<length><type><data><CRC>``. The CRC
+    covers type + data; computed over the concatenation."""
+    return (
+        len(data).to_bytes(4, "big")
+        + chunk_type
+        + data
+        + struct.pack(">I", zlib.crc32(chunk_type + data))
+    )
+
+
+def _build_xmp_basic_png(out: Path) -> None:
+    """Tiny PNG with an uncompressed iTXt chunk carrying XMP. Used for the
+    PNG dispatch path test — same kind of XMP content as the JPEG basic
+    fixture but smaller (just dc:title) since PNG XMP is exercised mainly
+    to validate the host-format walker."""
+    img = Image.new("RGBA", (1, 1), color=(0, 0, 0, 0))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    base = buf.getvalue()
+
+    rdf = """  <rdf:Description rdf:about=""
+    xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>
+      <rdf:Alt>
+        <rdf:li xml:lang="x-default">PNG XMP Title</rdf:li>
+      </rdf:Alt>
+    </dc:title>
+  </rdf:Description>"""
+    packet = _wrap_xmp_packet(rdf)
+
+    # iTXt: keyword \0 compression-flag(0) compression-method(0) lang \0 translated-keyword \0 text
+    itxt_data = b"XML:com.adobe.xmp\x00\x00\x00\x00\x00" + packet
+    chunk = _build_png_chunk(b"iTXt", itxt_data)
+
+    # Insert the iTXt chunk immediately after the IHDR chunk. PNG chunk order
+    # rules require IHDR first; iTXt has no positional constraint past that.
+    # IHDR length is fixed at 13 bytes, so it occupies bytes 8..33 of the file
+    # (8-byte signature + 4-length + 4-type + 13-data + 4-crc).
+    ihdr_end = len(_PNG_SIGNATURE_LITERAL) + 4 + 4 + 13 + 4
+    out.write_bytes(base[:ihdr_end] + chunk + base[ihdr_end:])
+
+
+# Module-private copy of the PNG signature for the fixture builder. Kept
+# inline rather than imported from the extractor module to keep
+# ``scripts/`` independent of ``src/`` (the script can be run standalone
+# without an installed package).
+_PNG_SIGNATURE_LITERAL: bytes = b"\x89PNG\r\n\x1a\n"
+
+
 def main() -> int:
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
     builders: list[tuple[str, Callable[[Path], None]]] = [
@@ -230,6 +387,10 @@ def main() -> int:
         ("iptc_basic.jpg", _build_iptc_basic_jpeg),
         ("iptc_none.jpg", _build_iptc_none_jpeg),
         ("iptc_corrupt.jpg", _build_iptc_corrupt_jpeg),
+        ("xmp_basic.jpg", _build_xmp_basic_jpeg),
+        ("xmp_none.jpg", _build_xmp_none_jpeg),
+        ("xmp_malformed.jpg", _build_xmp_malformed_jpeg),
+        ("xmp_basic.png", _build_xmp_basic_png),
     ]
     print(f"Writing fixtures to {FIXTURES_DIR}")
     for name, build in builders:
