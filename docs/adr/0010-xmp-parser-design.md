@@ -129,7 +129,7 @@ The error-in-result approach matches the project-wide pattern established in [AD
 - **IPTC**: a corrupt IIM record terminates the walker; partial data ships in `data`.
 - **XMP**: the four cases above.
 
-The original draft of this ADR flagged `CorruptMetadataError` (then defined but unused) as a separate cleanup question. ADR 0006 has since removed `CorruptMetadataError` and `UnsupportedFormatError` from the hierarchy on the grounds that they were architecturally unreachable — the orchestrator's catch-all never sees them, since extractors deliberately don't propagate "extant-but-corrupt" cases.
+The original draft of this ADR flagged `CorruptMetadataError` (then defined but unused) as a separate cleanup question. [ADR 0012](0012-reduced-exception-hierarchy.md) has since removed `CorruptMetadataError` and `UnsupportedFormatError` from the hierarchy on the grounds that they were architecturally unreachable — the orchestrator's catch-all never sees them, since extractors deliberately don't propagate "extant-but-corrupt" cases.
 
 ### XXE rejection as deliberate portfolio signal
 
@@ -153,7 +153,7 @@ If anyone ever swaps `defusedxml.ElementTree.fromstring` for the stdlib `xml.etr
 - ✅ **Friendly-prefix subset surface is reviewable in 6 lines.** Adding a namespace is one entry in the map.
 - ❌ **Extended XMP is unsupported.** Files with extended packets see only the main one. Acceptable since main-packet content covers the photo-editor-visible fields.
 - ❌ **Structured values inside Bag/Seq/Alt containers flatten to empty strings.** Documented as a v0.1 limitation; recursion into nested-Description-inside-li would double the flattening surface.
-- ❌ **Failed-decode paths aren't typed exceptions** — callers grep error-string content to distinguish "XMP parse error" from "Malformed compressed XMP iTXt chunk". Acceptable given the partial-extraction semantic, but a future refactor could let exceptions carry partial context (see ADR 0006's "Reconsider" line).
+- ❌ **Failed-decode paths aren't typed exceptions** — callers grep error-string content to distinguish "XMP parse error" from "Malformed compressed XMP iTXt chunk". Acceptable given the partial-extraction semantic, but a future refactor could let exceptions carry partial context (see ADR 0012's "Reconsider" line).
 - 🔄 **Reconsider extended XMP** if a real consumer needs thumbnails-or-history from the second packet. The segment-walker can be extended to locate-and-merge.
 - 🔄 **Reconsider TIFF host-format support** when TIFF support overall is added. Tag 700 is the standard location.
 - 🔄 **Reconsider the friendly-prefix map** if a real workflow wants Lightroom-develop or another vendor namespace surfaced. Adding a prefix is one map entry; no logic change.

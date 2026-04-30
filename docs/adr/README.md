@@ -16,6 +16,7 @@ Format: [MADR](https://adr.github.io/madr/) (Status / Context / Decision / Conse
 - [0008 — EXIF parsing strategy](0008-exif-parsing-strategy.md)
 - [0009 — IPTC parser design](0009-iptc-parser-design.md)
 - [0010 — XMP parser design](0010-xmp-parser-design.md)
+- [0012 — Reduced exception hierarchy](0012-reduced-exception-hierarchy.md) *(revises [0006](0006-custom-exception-hierarchy.md))*
 
 ## When to write a new ADR
 
