@@ -22,6 +22,10 @@ Each fixture below documents: filename, content summary, origin/license, and exp
 | `iptc_basic.jpg` | 3a | Generated (`scripts/build_fixtures.py`) | 100×100 JPEG with hand-built APP13/Photoshop IRB / IIM: Title, three repeating Keywords (alpha/beta/gamma), Byline, Copyright (with non-ASCII ©). Includes the `\x1b%G` UTF-8 charset escape so the parser exercises CodedCharacterSet resolution. | _SHA varies with Pillow encoder; not asserted_ |
 | `iptc_none.jpg` | 3a | Generated (`scripts/build_fixtures.py`) | 100×100 JPEG explicitly without any IPTC block | _SHA varies with Pillow encoder; not asserted_ |
 | `iptc_corrupt.jpg` | 3a | Generated (`scripts/build_fixtures.py`) | 100×100 JPEG whose IIM record declares value-size 9999 with only ~9 bytes of value — drives the IIM walker's bounds-check path | _SHA varies with Pillow encoder; not asserted_ |
+| `xmp_basic.jpg` | 3b | Generated (`scripts/build_fixtures.py`) | 100×100 JPEG with hand-built APP1/XMP packet exercising every flattening rule: `dc:title` (Alt → x-default lang), `dc:subject` (Bag → list), `dc:creator` (Seq → list), `xmp:CreatorTool`, `photoshop:Headline`, plus a `vendor:OutOfScope` element from an unknown namespace that should be silently dropped | _SHA varies with Pillow encoder; not asserted_ |
+| `xmp_none.jpg` | 3b | Generated (`scripts/build_fixtures.py`) | 100×100 JPEG explicitly without any XMP packet | _SHA varies with Pillow encoder; not asserted_ |
+| `xmp_malformed.jpg` | 3b | Generated (`scripts/build_fixtures.py`) | 100×100 JPEG with a structurally broken XMP packet (unclosed root element) — drives the `xml.etree.ElementTree.ParseError` path | _SHA varies with Pillow encoder; not asserted_ |
+| `xmp_basic.png` | 3b | Generated (`scripts/build_fixtures.py`) | 1×1 PNG with an uncompressed `iTXt` chunk carrying XMP — exercises the PNG host-format dispatch path | _SHA varies with Pillow encoder; not asserted_ |
 
 ## Regenerating
 

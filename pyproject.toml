@@ -41,6 +41,8 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.10",
     "pre-commit>=3.7",
+    # Type stubs for our XML dep — defusedxml itself ships no inline types.
+    "types-defusedxml>=0.7",
 ]
 docs = [
     "sphinx>=7",

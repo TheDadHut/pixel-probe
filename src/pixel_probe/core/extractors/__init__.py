@@ -4,6 +4,7 @@ from .base import Extractor, ExtractorResult
 from .exif import ExifData, ExifExtractor
 from .file_info import FileInfo, FileInfoExtractor
 from .iptc import IptcData, IptcExtractor
+from .xmp import XmpData, XmpExtractor
 
 __all__ = [
     "ExifData",
@@ -14,4 +15,6 @@ __all__ = [
     "FileInfoExtractor",
     "IptcData",
     "IptcExtractor",
+    "XmpData",
+    "XmpExtractor",
 ]
