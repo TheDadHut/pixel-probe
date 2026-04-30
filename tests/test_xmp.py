@@ -23,6 +23,7 @@ from defusedxml.ElementTree import fromstring
 
 from pixel_probe.core.analyzer import Analyzer
 from pixel_probe.core.extractors.xmp import (
+    _MAX_DECOMPRESSED_XMP_BYTES,
     XmpExtractor,
     _find_xmp_packet,
     _find_xmp_packet_jpeg,
@@ -288,12 +289,12 @@ def test_compressed_png_itxt_decompresses_end_to_end(tmp_path: Path) -> None:
     assert result.data["dc"]["title"] == "Compressed XMP"
 
 
-def test_compressed_png_itxt_malformed_surfaces_warning(tmp_path: Path) -> None:
+def test_compressed_png_itxt_malformed_surfaces_error(tmp_path: Path) -> None:
     """End-to-end: a PNG whose compressed iTXt body isn't a valid zlib
-    stream surfaces a warning on the result envelope rather than crashing
-    or silently returning empty. The walker's no-crash invariant covers
-    this for binary parsers; this test pins the user-visible behavior at
-    the extractor level."""
+    stream surfaces an error on the result envelope rather than crashing
+    or silently returning empty. Severity is error (not warning) — same
+    severity as the malformed-XML path, since both are "we found a chunk
+    but couldn't decode it"."""
     payload = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00not zlib at all"
     chunk = _build_png_chunk(b"iTXt", payload)
     out = tmp_path / "malformed.png"
@@ -302,8 +303,28 @@ def test_compressed_png_itxt_malformed_surfaces_warning(tmp_path: Path) -> None:
     result = XmpExtractor().extract(out)
 
     assert result.data == {}
-    assert result.errors == ()
-    assert any("Malformed compressed" in w for w in result.warnings)
+    assert result.warnings == ()
+    assert any("Malformed compressed" in e for e in result.errors)
+
+
+def test_compressed_png_itxt_bomb_surfaces_error(tmp_path: Path) -> None:
+    """End-to-end zlib-bomb defense: a PNG with a tiny compressed iTXt that
+    inflates past ``_MAX_DECOMPRESSED_XMP_BYTES`` is rejected without
+    allocating the full output. Surfaces as an error so the security gate
+    is visible to consumers, parallel to the malformed-XML path. Without
+    this cap, a malicious PNG could trigger OOM during decompression."""
+    bomb_payload = b"a" * (_MAX_DECOMPRESSED_XMP_BYTES + 1024)
+    compressed = zlib.compress(bomb_payload)
+    payload = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00" + compressed
+    chunk = _build_png_chunk(b"iTXt", payload)
+    out = tmp_path / "bomb.png"
+    out.write_bytes(_PNG_SIGNATURE + chunk)
+
+    result = XmpExtractor().extract(out)
+
+    assert result.data == {}
+    assert result.warnings == ()
+    assert any("decompression bomb" in e.lower() for e in result.errors)
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +660,32 @@ def test_flatten_xmp_bookkeeping_namespaces_excluded_from_warning() -> None:
     assert warnings == []
 
 
+def test_flatten_xmp_duplicate_field_overwrite_surfaces_warning() -> None:
+    """Two ``<rdf:Description>`` blocks both defining ``dc:title`` →
+    later wins, but the overwrite surfaces a warning so the silent-
+    overwrite policy is visible. Real-world XMP rarely has duplicates
+    (Description blocks split by namespace), so this fires only on
+    pathological input — but when it does, the warning is the user's
+    only signal that they're seeing one of two definitions."""
+    xml = (
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about=""'
+        '  xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        "<dc:title>First definition</dc:title>"
+        "</rdf:Description>"
+        '<rdf:Description rdf:about=""'
+        '  xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        "<dc:title>Second definition (wins)</dc:title>"
+        "</rdf:Description>"
+        "</rdf:RDF>"
+    )
+    root = fromstring(xml)
+    data, warnings = _flatten_xmp(root)
+    assert data == {"dc": {"title": "Second definition (wins)"}}
+    assert any("dc:title" in w for w in warnings)
+    assert any("overwrote" in w for w in warnings)
+
+
 def test_flatten_xmp_bookkeeping_element_excluded_from_warning() -> None:
     """Element-form parity for the bookkeeping-namespace exclusion.
     A child element from ``xmpNote`` (the ExtendedXMP marker carrier)
@@ -666,9 +713,9 @@ def test_flatten_xmp_bookkeeping_element_excluded_from_warning() -> None:
 
 
 def test_find_xmp_packet_unknown_format_returns_none() -> None:
-    """Bytes that match neither JPEG SOI nor the PNG signature → ``(None, [])``."""
-    assert _find_xmp_packet(b"GIF89a...some random bytes") == (None, [])
-    assert _find_xmp_packet(b"") == (None, [])
+    """Bytes that match neither JPEG SOI nor the PNG signature → ``(None, [], [])``."""
+    assert _find_xmp_packet(b"GIF89a...some random bytes") == (None, [], [])
+    assert _find_xmp_packet(b"") == (None, [], [])
 
 
 def test_find_xmp_packet_jpeg_no_xmp_returns_none() -> None:
@@ -793,7 +840,7 @@ def test_find_xmp_packet_png_chunk_data_overruns_buffer() -> None:
         + b"abcd"  # any chunk type
         + b"xxxx"  # 4 dummy bytes — enough to satisfy the outer 20-byte threshold
     )
-    assert _find_xmp_packet_png(overrun) == (None, [])
+    assert _find_xmp_packet_png(overrun) == (None, [], [])
 
 
 # ---------------------------------------------------------------------------
@@ -817,14 +864,14 @@ _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def test_find_xmp_packet_png_no_xmp_returns_none() -> None:
-    """A PNG with no XMP iTXt chunk → ``(None, [])``."""
-    assert _find_xmp_packet_png(_PNG_SIGNATURE) == (None, [])
+    """A PNG with no XMP iTXt chunk → ``(None, [], [])``."""
+    assert _find_xmp_packet_png(_PNG_SIGNATURE) == (None, [], [])
 
 
 def test_find_xmp_packet_png_handles_truncated_chunk() -> None:
-    """A chunk header declaring more data than remains → ``(None, [])``, no crash."""
+    """A chunk header declaring more data than remains → ``(None, [], [])``, no crash."""
     truncated = _PNG_SIGNATURE + (9999).to_bytes(4, "big") + b"iTXt" + b"abc"
-    assert _find_xmp_packet_png(truncated) == (None, [])
+    assert _find_xmp_packet_png(truncated) == (None, [], [])
 
 
 def test_find_xmp_packet_png_decompresses_compressed_xmp() -> None:
@@ -841,35 +888,64 @@ def test_find_xmp_packet_png_decompresses_compressed_xmp() -> None:
     payload = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00" + compressed_xmp
     chunk = _build_png_chunk(b"iTXt", payload)
     png = _PNG_SIGNATURE + chunk
-    packet, warnings = _find_xmp_packet_png(png)
+    packet, warnings, errors = _find_xmp_packet_png(png)
     assert packet == real_xmp
     assert warnings == []
+    assert errors == []
 
 
-def test_find_xmp_packet_png_warns_on_malformed_compressed_xmp() -> None:
+def test_find_xmp_packet_png_errors_on_malformed_compressed_xmp() -> None:
     """A compression-flag=1 iTXt whose body isn't valid zlib triggers
-    ``zlib.error``; the walker surfaces a warning instead of raising —
-    keeps the parse no-crash invariant for adversarial inputs."""
-    # Garbage bytes that aren't a valid zlib stream.
+    ``zlib.error``; the walker surfaces an error (not warning) instead of
+    raising — keeps the parse no-crash invariant for adversarial inputs.
+    Severity matches the malformed-XML path: "we found a chunk but
+    couldn't decode it"."""
     payload = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00not valid zlib data"
     chunk = _build_png_chunk(b"iTXt", payload)
     png = _PNG_SIGNATURE + chunk
-    packet, warnings = _find_xmp_packet_png(png)
+    packet, warnings, errors = _find_xmp_packet_png(png)
     assert packet is None
-    assert any("Malformed compressed" in w for w in warnings)
+    assert warnings == []
+    assert any("Malformed compressed" in e for e in errors)
 
 
-def test_find_xmp_packet_png_warns_on_unknown_compression_flag() -> None:
+def test_find_xmp_packet_png_errors_on_unknown_compression_flag() -> None:
     """The PNG iTXt spec defines compression-flag values 0 (uncompressed)
-    and 1 (zlib). Any other value indicates a malformed chunk; we surface
-    a warning rather than blindly reading the rest as text. Defensive
-    against malformed inputs."""
+    and 1 (zlib). Any other value indicates a malformed chunk; surface as
+    an error rather than blindly reading the rest as text. Defensive
+    against malformed inputs and parity with the malformed-zlib case."""
     malformed = b"XML:com.adobe.xmp\x00\x07\x00\x00\x00<looks like XMP body>"
     chunk = _build_png_chunk(b"iTXt", malformed)
     png = _PNG_SIGNATURE + chunk
-    packet, warnings = _find_xmp_packet_png(png)
+    packet, warnings, errors = _find_xmp_packet_png(png)
     assert packet is None
-    assert any("Unrecognized iTXt compression flag" in w for w in warnings)
+    assert warnings == []
+    assert any("Unrecognized iTXt compression flag" in e for e in errors)
+
+
+def test_find_xmp_packet_png_errors_on_decompression_bomb() -> None:
+    """Defends against the zlib-bomb DoS: a small compressed iTXt whose
+    inflated payload would exceed ``_MAX_DECOMPRESSED_XMP_BYTES``. The
+    walker rejects it via ``decompressobj``'s ``max_length`` cap and
+    ``unconsumed_tail`` check — bomb is detected without allocating the
+    full output. Surfaces as an error so the security gate is visible.
+
+    The bomb payload is constructed by compressing a string longer than
+    the cap; ``zlib.compress`` of repeated bytes has near-1000:1 ratio, so
+    the compressed input is tiny."""
+    bomb_payload = b"a" * (_MAX_DECOMPRESSED_XMP_BYTES + 1024)
+    compressed = zlib.compress(bomb_payload)
+    # Sanity: compressed size is way under the cap (typically <1 KB for ~16 MB
+    # of repeated bytes), so the walker has to actually start decompressing
+    # to encounter the cap — pinning the bomb-detection path.
+    assert len(compressed) < 1024 * 1024  # well under 1 MB
+    payload = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00" + compressed
+    chunk = _build_png_chunk(b"iTXt", payload)
+    png = _PNG_SIGNATURE + chunk
+    packet, warnings, errors = _find_xmp_packet_png(png)
+    assert packet is None
+    assert warnings == []
+    assert any("decompression bomb" in e.lower() for e in errors)
 
 
 def test_find_xmp_packet_png_skips_non_xmp_itxt() -> None:
@@ -879,27 +955,27 @@ def test_find_xmp_packet_png_skips_non_xmp_itxt() -> None:
     payload = b"Author\x00\x00\x00\x00\x00Alice"
     chunk = _build_png_chunk(b"iTXt", payload)
     png = _PNG_SIGNATURE + chunk
-    assert _find_xmp_packet_png(png) == (None, [])
+    assert _find_xmp_packet_png(png) == (None, [], [])
 
 
 def test_read_itxt_xmp_handles_missing_keyword_terminator() -> None:
-    """An iTXt payload with no NUL terminator after the keyword → ``(None, [])``."""
-    assert _read_itxt_xmp(b"XML:com.adobe.xmp_no_nul_here") == (None, [])
+    """An iTXt payload with no NUL terminator after the keyword → ``(None, [], [])``."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp_no_nul_here") == (None, [], [])
 
 
 def test_read_itxt_xmp_handles_truncated_after_keyword() -> None:
-    """An iTXt payload that ends before the compression flags fits → ``(None, [])``."""
-    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00") == (None, [])
+    """An iTXt payload that ends before the compression flags fits → ``(None, [], [])``."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00") == (None, [], [])
 
 
 def test_read_itxt_xmp_handles_missing_lang_terminator() -> None:
-    """An iTXt payload missing the language-tag NUL terminator → ``(None, [])``."""
-    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00\x00\x00xx-no-end") == (None, [])
+    """An iTXt payload missing the language-tag NUL terminator → ``(None, [], [])``."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00\x00\x00xx-no-end") == (None, [], [])
 
 
 def test_read_itxt_xmp_handles_missing_translated_keyword_terminator() -> None:
-    """An iTXt payload missing the translated-keyword NUL terminator → ``(None, [])``."""
-    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00\x00\x00\x00no-end") == (None, [])
+    """An iTXt payload missing the translated-keyword NUL terminator → ``(None, [], [])``."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00\x00\x00\x00no-end") == (None, [], [])
 
 
 # ---------------------------------------------------------------------------

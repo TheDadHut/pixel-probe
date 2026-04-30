@@ -9,9 +9,12 @@ v0.1 supports two host formats:
   detected and parse only the main packet.
 - **PNG** — iTXt chunk with keyword ``XML:com.adobe.xmp``. Both
   uncompressed (compression-flag = 0) and zlib-compressed
-  (compression-flag = 1) chunks are supported; we use the stdlib
-  :mod:`zlib` to decompress. Malformed compressed streams surface as
-  a warning rather than raising.
+  (compression-flag = 1) chunks are supported via stdlib :mod:`zlib`.
+  Decompression is bounded by :data:`_MAX_DECOMPRESSED_XMP_BYTES` to
+  defend against decompression-bomb DoS. Malformed compressed streams
+  and oversized inflated payloads surface as errors on the result
+  envelope (matching the malformed-XML severity) rather than raising
+  out of the extractor.
 
 TIFF (tag 700) is out of scope for v1 — TIFF support overall is deferred
 until a real-world need surfaces.
@@ -90,6 +93,14 @@ _PNG_SIGNATURE: Final = b"\x89PNG\r\n\x1a\n"
 _PNG_ITXT_TYPE: Final = b"iTXt"
 _PNG_XMP_KEYWORD: Final = b"XML:com.adobe.xmp"
 
+#: Output cap on zlib-decompressed iTXt payloads. Defends against
+#: decompression-bomb DoS (a small compressed chunk that inflates to
+#: gigabytes), parallel to ADR 0007's Pillow ``MAX_IMAGE_PIXELS`` gate.
+#: Real-world XMP packets are well under 100 KB; 16 MB is generous
+#: enough to never reject a legitimate file while bounding adversarial
+#: input by ~32:1 against the project-wide 500 MB file cap.
+_MAX_DECOMPRESSED_XMP_BYTES: Final = 16 * 1024 * 1024
+
 # RDF / XML namespace URIs — used for ElementTree's '{uri}local' form.
 _RDF_NS: Final = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 _XML_NS: Final = "http://www.w3.org/XML/1998/namespace"
@@ -122,30 +133,44 @@ _NAMESPACE_PREFIXES: Final[dict[str, str]] = {
 #: from the dropped-namespace warning so the warning lists only namespaces
 #: that *would* have been surfaced if the friendly map covered them — i.e.
 #: actual vendor / extension schemas the user might be missing.
+#:
+#: - ``_RDF_NS`` — ``rdf:about``, ``rdf:type``, etc. on Description.
+#: - ``_XML_NS`` — ``xml:lang`` and friends.
+#: - ``_XMP_NOTE_NS`` — only ``xmpNote:HasExtendedXMP`` per spec; detected
+#:   by :func:`_has_extended_xmp` and excluded here so the marker doesn't
+#:   produce a noise warning. If Adobe ever extends this namespace beyond
+#:   the marker, the new properties would be silently dropped — accept this
+#:   risk because the spec is stable.
+#: - ``adobe:ns:meta/`` — defensive: the ``x:xmpmeta`` wrapper's own
+#:   attributes aren't currently iterated by the walker, but the entry
+#:   keeps us safe if a future code path ever does.
 _BOOKKEEPING_NAMESPACES: Final[frozenset[str]] = frozenset(
     {
         _RDF_NS,
         _XML_NS,
-        _XMP_NOTE_NS,  # xmpNote:HasExtendedXMP is detected separately and not surfaced
-        "adobe:ns:meta/",  # x:xmpmeta wrapper
+        _XMP_NOTE_NS,
+        "adobe:ns:meta/",
     }
 )
 
 
-def _find_xmp_packet(raw: bytes) -> tuple[bytes | None, list[str]]:
+def _find_xmp_packet(raw: bytes) -> tuple[bytes | None, list[str], list[str]]:
     """Locate the XMP packet bytes in a JPEG or PNG byte stream.
 
-    Dispatches on file signature. Returns ``(packet_or_None, warnings)`` —
-    warnings carry diagnostics from the host-format walker (e.g. "compressed
-    iTXt detected" on the PNG path) so the extractor can surface them on
-    the result envelope. ``packet`` is ``None`` when the host format is
-    unsupported or no usable XMP packet is present.
+    Dispatches on file signature. Returns ``(packet_or_None, warnings,
+    errors)`` — warnings and errors both carry diagnostics from the
+    host-format walker so the extractor can surface them on the result
+    envelope at the right severity. Errors describe failed-parse cases
+    ("we found something but couldn't decode it"); warnings describe
+    non-fatal anomalies. ``packet`` is ``None`` when the host format is
+    unsupported, no XMP packet is present, or every found chunk failed
+    to decode.
     """
     if raw.startswith(_JPEG_SOI):
-        return _find_xmp_packet_jpeg(raw), []
+        return _find_xmp_packet_jpeg(raw), [], []
     if raw.startswith(_PNG_SIGNATURE):
         return _find_xmp_packet_png(raw)
-    return None, []
+    return None, [], []
 
 
 def _find_xmp_packet_jpeg(raw: bytes) -> bytes | None:
@@ -181,20 +206,23 @@ def _find_xmp_packet_jpeg(raw: bytes) -> bytes | None:
     return None
 
 
-def _find_xmp_packet_png(raw: bytes) -> tuple[bytes | None, list[str]]:
+def _find_xmp_packet_png(raw: bytes) -> tuple[bytes | None, list[str], list[str]]:
     """Walk PNG chunks looking for an iTXt chunk with the XMP keyword.
 
     PNG chunk layout: ``<4-byte BE length> <4-byte type> <data> <4-byte CRC>``.
     The length field describes ``data`` only — the type field and CRC are
     fixed-size. We bounds-check before each chunk read.
 
-    Returns ``(packet_or_None, warnings)``. A malformed compressed iTXt
-    stream surfaces a warning so the user sees why nothing was parsed
-    instead of silently looking like "no XMP".
+    Returns ``(packet_or_None, warnings, errors)``. Errors collect
+    "we found an XMP iTXt chunk but couldn't decode it" cases so they
+    surface at the right severity; warnings stay reserved for non-fatal
+    anomalies (currently none from this walker, but the slot is plumbed
+    for parity with the dispatcher's tuple shape).
     """
     offset = len(_PNG_SIGNATURE)
     n = len(raw)
     warnings: list[str] = []
+    errors: list[str] = []
     # Minimum chunk shape: 4 length + 4 type + 4 CRC = 12 bytes.
     while offset + 12 <= n:
         length = int.from_bytes(raw[offset : offset + 4], "big")
@@ -203,56 +231,79 @@ def _find_xmp_packet_png(raw: bytes) -> tuple[bytes | None, list[str]]:
         data_end = data_start + length
         # data_end + 4 because the CRC follows the data.
         if data_end + 4 > n:
-            return None, warnings
+            return None, warnings, errors
         if chunk_type == _PNG_ITXT_TYPE:
-            packet, chunk_warnings = _read_itxt_xmp(raw[data_start:data_end])
+            packet, chunk_warnings, chunk_errors = _read_itxt_xmp(raw[data_start:data_end])
             warnings.extend(chunk_warnings)
+            errors.extend(chunk_errors)
             if packet is not None:
-                return packet, warnings
+                return packet, warnings, errors
         offset = data_end + 4  # next chunk: skip CRC
-    return None, warnings
+    return None, warnings, errors
 
 
-def _read_itxt_xmp(data: bytes) -> tuple[bytes | None, list[str]]:
+def _read_itxt_xmp(data: bytes) -> tuple[bytes | None, list[str], list[str]]:
     """Parse an iTXt chunk payload; return its text only when keyword is XMP.
 
     iTXt structure: ``keyword \\0 compression-flag(1) compression-method(1)
     language-tag \\0 translated-keyword \\0 text``. We bounds-check each
     NUL-terminated section and bail on truncation.
 
-    Returns ``(packet_or_None, warnings)``. PNG spec defines compression
-    flag 0 (uncompressed) and 1 (zlib); we decompress flag 1 via
-    :mod:`zlib` (stdlib — no extra runtime dep). Malformed compressed
-    streams (``zlib.error``) surface as a warning so the user sees why
-    nothing was parsed instead of silently looking like "no XMP". Other
-    non-spec flag values are treated as "skip + warn" — same robustness
-    posture against malformed chunks.
+    Returns ``(packet_or_None, warnings, errors)``. PNG spec defines
+    compression flag 0 (uncompressed) and 1 (zlib); we decompress flag 1
+    via :mod:`zlib` (stdlib — no extra runtime dep). Decompression is
+    bounded by :data:`_MAX_DECOMPRESSED_XMP_BYTES` to prevent
+    decompression-bomb DoS — a small compressed chunk that would inflate
+    to gigabytes is rejected without allocating its full output.
+
+    Failure cases are surfaced as **errors** (not warnings): malformed
+    compressed streams (``zlib.error``), oversized decompression
+    (suspected bomb), and non-spec compression flags. Each is "we found
+    an XMP iTXt chunk and couldn't decode it" — the same severity as the
+    extractor's malformed-XML path.
     """
     nul = data.find(b"\x00")
     if nul == -1 or data[:nul] != _PNG_XMP_KEYWORD:
-        return None, []
+        return None, [], []
     # Need at least: nul + compression-flag + compression-method = nul + 3
     if len(data) < nul + 3:
-        return None, []
+        return None, [], []
     compression_flag = data[nul + 1]
     # Skip language tag (\0-terminated) and translated keyword (\0-terminated).
     lang_start = nul + 3
     lang_end = data.find(b"\x00", lang_start)
     if lang_end == -1:
-        return None, []
+        return None, [], []
     tkw_end = data.find(b"\x00", lang_end + 1)
     if tkw_end == -1:
-        return None, []
+        return None, [], []
     text = data[tkw_end + 1 :]
     if compression_flag == 0:
-        return text, []
+        return text, [], []
     if compression_flag == 1:
         try:
-            return zlib.decompress(text), []
+            decompressor = zlib.decompressobj()
+            decoded = decompressor.decompress(text, _MAX_DECOMPRESSED_XMP_BYTES)
+            # If decompressor.unconsumed_tail is non-empty, more data was
+            # available than the cap allowed — i.e. the inflated payload
+            # exceeds our threshold. Don't call flush(); doing so would
+            # decompress the rest and defeat the cap. Reject as a bomb.
+            if decompressor.unconsumed_tail:
+                return (
+                    None,
+                    [],
+                    [
+                        f"Compressed XMP iTXt chunk exceeds the "
+                        f"{_MAX_DECOMPRESSED_XMP_BYTES:,}-byte decompression cap; "
+                        f"rejected as suspected decompression bomb"
+                    ],
+                )
+            decoded += decompressor.flush()
         except zlib.error as e:
-            return None, [f"Malformed compressed XMP iTXt chunk: {type(e).__name__}: {e}"]
-    # Non-spec flag values (PNG defines 0 and 1 only). Treat as malformed.
-    return None, [f"Unrecognized iTXt compression flag {compression_flag}; chunk ignored"]
+            return None, [], [f"Malformed compressed XMP iTXt chunk: {type(e).__name__}: {e}"]
+        return decoded, [], []
+    # Non-spec flag values (PNG defines 0 and 1 only).
+    return None, [], [f"Unrecognized iTXt compression flag {compression_flag}; chunk ignored"]
 
 
 def _strip_namespace(qname: str) -> tuple[str | None, str]:
@@ -344,18 +395,27 @@ def _flatten_xmp(root: Element) -> tuple[XmpData, list[str]]:
     """Walk an ``x:xmpmeta`` (or bare ``rdf:RDF``) tree and produce the
     flattened ``{prefix: {field: value}}`` dict for known namespaces.
 
-    Multiple ``<rdf:Description>`` blocks merge into the same prefix dict;
-    later definitions overwrite earlier ones (XMP allows duplicates and
-    we trust the file's order — the first or last is policy, not
-    correctness).
+    Multiple ``<rdf:Description>`` blocks merge into the same prefix dict.
+    When two blocks define the same ``(prefix, field)`` pair, the later
+    definition wins (XMP allows duplicates and we trust the file's order)
+    — but the overwrite surfaces a warning so it's visible to consumers
+    who care.
 
-    Returns ``(data, warnings)``. ``warnings`` collects properties dropped
-    from namespaces outside :data:`_NAMESPACE_PREFIXES` and surfaces them
-    as a single batched message — visible enough that a user expecting
-    e.g. Lightroom-develop XMP knows the data was present but unsurfaced.
-    Bookkeeping namespaces that don't carry user-visible data (RDF itself,
-    the empty-namespace ``rdf:about`` etc.) are excluded from the count
-    so the warning isn't noise.
+    Returns ``(data, warnings)``. ``warnings`` collects two kinds of
+    visibility signal:
+
+    - **Dropped vendor namespaces.** Properties from URIs outside
+      :data:`_NAMESPACE_PREFIXES` are dropped from ``data``; their
+      namespace URIs are accumulated and surfaced as one batched warning
+      so a user expecting e.g. Lightroom-develop XMP knows the data was
+      present but unsurfaced.
+    - **Duplicate-field overwrites.** When a later ``<rdf:Description>``
+      overwrites an earlier definition of the same ``(prefix, field)``,
+      the pairs are accumulated and surfaced as one batched warning so
+      the silent-overwrite policy is visible.
+
+    Bookkeeping namespaces (RDF itself, ``xml:lang``, etc.) are excluded
+    from the dropped-namespace count so the warning isn't noise.
     """
     rdf = root if root.tag == _RDF_RDF else root.find(_RDF_RDF)
     if rdf is None:
@@ -363,6 +423,17 @@ def _flatten_xmp(root: Element) -> tuple[XmpData, list[str]]:
 
     data: XmpData = {}
     dropped_namespaces: set[str] = set()
+    overwritten: set[tuple[str, str]] = set()
+
+    def _set_field(prefix: str, local: str, value: Any) -> None:
+        """Set ``data[prefix][local] = value``, tracking overwrites for the
+        duplicate-field warning. Inner closure so overwrites accumulate
+        without threading another collection through the loop."""
+        bucket = data.setdefault(prefix, {})
+        if local in bucket:
+            overwritten.add((prefix, local))
+        bucket[local] = value
+
     for desc in rdf.findall(_RDF_DESCRIPTION):
         # Attribute form: <rdf:Description dc:title="foo" .../>
         for attr_qname, attr_value in desc.attrib.items():
@@ -372,7 +443,7 @@ def _flatten_xmp(root: Element) -> tuple[XmpData, list[str]]:
                 if uri is not None and uri not in _BOOKKEEPING_NAMESPACES:
                     dropped_namespaces.add(uri)
                 continue
-            data.setdefault(prefix, {})[local] = attr_value
+            _set_field(prefix, local, attr_value)
         # Element form: <dc:title>...</dc:title> with optional structured value
         for prop in desc:
             uri, local = _strip_namespace(prop.tag)
@@ -381,12 +452,7 @@ def _flatten_xmp(root: Element) -> tuple[XmpData, list[str]]:
                 if uri is not None and uri not in _BOOKKEEPING_NAMESPACES:
                     dropped_namespaces.add(uri)
                 continue
-            # Note: when multiple <rdf:Description> blocks define the same
-            # (prefix, local) pair, the later one wins. Documented as policy
-            # in the function docstring above; in practice Description blocks
-            # split by namespace rather than duplicating fields, so this
-            # rarely fires.
-            data.setdefault(prefix, {})[local] = _flatten_value(prop)
+            _set_field(prefix, local, _flatten_value(prop))
 
     warnings: list[str] = []
     if dropped_namespaces:
@@ -395,6 +461,13 @@ def _flatten_xmp(root: Element) -> tuple[XmpData, list[str]]:
         joined = ", ".join(sorted(dropped_namespaces))
         count = len(dropped_namespaces)
         warnings.append(f"Dropped properties from {count} unsurfaced namespace(s): {joined}")
+    if overwritten:
+        # Same deterministic-ordering rationale as the dropped-namespace warning.
+        joined = ", ".join(sorted(f"{prefix}:{local}" for prefix, local in overwritten))
+        count = len(overwritten)
+        warnings.append(
+            f"Later <rdf:Description> overwrote {count} previously-set field(s): {joined}"
+        )
     return data, warnings
 
 
@@ -453,11 +526,17 @@ class XmpExtractor(Extractor[XmpData]):
                 warnings=("File is not a JPEG or PNG; XMP v0.1 supports JPEG/PNG only",),
             )
 
-        packet, locator_warnings = _find_xmp_packet(raw)
+        packet, locator_warnings, locator_errors = _find_xmp_packet(raw)
         if packet is None:
-            # Surface any host-format walker diagnostics (e.g. compressed-iTXt
-            # detection) so the user sees why nothing was parsed.
-            return ExtractorResult(self.name, data, warnings=tuple(locator_warnings))
+            # Surface any host-format walker diagnostics (e.g. malformed
+            # compressed iTXt, decompression-bomb detection) so the user
+            # sees why nothing was parsed.
+            return ExtractorResult(
+                self.name,
+                data,
+                warnings=tuple(locator_warnings),
+                errors=tuple(locator_errors),
+            )
 
         try:
             root = _safe_fromstring(packet)
@@ -468,14 +547,20 @@ class XmpExtractor(Extractor[XmpData]):
                 self.name,
                 data,
                 warnings=tuple(locator_warnings),
-                errors=(f"XMP rejected for security: {type(e).__name__}: {e}",),
+                errors=(
+                    *locator_errors,
+                    f"XMP rejected for security: {type(e).__name__}: {e}",
+                ),
             )
         except ParseError as e:
             return ExtractorResult(
                 self.name,
                 data,
                 warnings=tuple(locator_warnings),
-                errors=(f"XMP parse error: {type(e).__name__}: {e}",),
+                errors=(
+                    *locator_errors,
+                    f"XMP parse error: {type(e).__name__}: {e}",
+                ),
             )
 
         warnings: list[str] = list(locator_warnings)
@@ -489,4 +574,9 @@ class XmpExtractor(Extractor[XmpData]):
 
         flattened, flatten_warnings = _flatten_xmp(root)
         warnings.extend(flatten_warnings)
-        return ExtractorResult(self.name, flattened, warnings=tuple(warnings))
+        return ExtractorResult(
+            self.name,
+            flattened,
+            warnings=tuple(warnings),
+            errors=tuple(locator_errors),
+        )

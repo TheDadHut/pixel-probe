@@ -79,15 +79,21 @@ But silent drops were a footgun: a file with Lightroom-develop XMP looked indist
 
 The `xmpNote` namespace is detected as a special case for the `HasExtendedXMP` marker but never surfaced in the result.
 
-### Compressed iTXt: decompress via stdlib `zlib`
+A parallel **duplicate-field-overwrite warning** fires when two `<rdf:Description>` blocks both define the same `(prefix, field)` pair. Later wins (XMP allows duplicates and we trust the file's order) — but the warning makes the policy visible to consumers who'd otherwise see only one of two definitions with no signal that anything was overridden. Real-world XMP rarely has duplicates (Description blocks split by namespace), so the warning fires only on pathological input.
 
-PNG iTXt chunks have a compression flag (0 = uncompressed, 1 = zlib). Both are supported.
+### Compressed iTXt: bounded decompression via stdlib `zlib`
 
-`_read_itxt_xmp` calls `zlib.decompress` on flag-1 chunks. `zlib` is in the Python standard library — we already use it in `scripts/build_fixtures.py` for PNG chunk CRCs — so this is not a runtime-dep cost. The trade-off is one new error path: a malformed compressed stream raises `zlib.error`, which we catch and surface as a warning ("Malformed compressed XMP iTXt chunk: …") without raising out of the extractor.
+PNG iTXt chunks have a compression flag (0 = uncompressed, 1 = zlib). Both are supported via the Python standard library — `zlib` is not a runtime-dep cost (we already use it in `scripts/build_fixtures.py` for PNG chunk CRCs).
 
-Non-spec flag values (PNG defines 0 and 1 only) surface a separate warning ("Unrecognized iTXt compression flag {N}; chunk ignored") rather than blindly reading the rest as text. Defensive posture against malformed chunks.
+`_read_itxt_xmp` decompresses flag-1 chunks via `zlib.decompressobj()` with `max_length = _MAX_DECOMPRESSED_XMP_BYTES` (16 MB). The `decompressobj` API + `unconsumed_tail` check is used instead of `zlib.decompress` because:
 
-The original v0.1 framing was "skip + warn" with a "keep zlib decode complexity out of the path" rationale. That framing was wrong on the costs — `zlib` is stdlib, not a dep, and the new error path is a clean `zlib.error` catch — so decompressing makes the PNG XMP host-format path feature-complete with no real cost.
+- **Decompression-bomb DoS defense.** A small compressed iTXt chunk can inflate to gigabytes (zlib achieves easy 1000:1 ratios on repeated bytes). `zlib.decompress` has no output cap and would happily allocate the full payload — same threat surface [ADR 0007](0007-adversarial-input-handling.md) defends against for Pillow's pixel-count gates.
+- `decompressobj(...).decompress(data, max_length)` decodes only up to the cap. If `unconsumed_tail` is non-empty afterward, we know the inflated payload exceeds the threshold; we **don't call `flush()`** (which would defeat the cap) and instead reject the chunk as a suspected bomb.
+- 16 MB is generous (real-world XMP packets are <100 KB) and bounds adversarial input by ~32:1 against the project-wide `MAX_FILE_SIZE_BYTES` ceiling.
+
+**Failure-case severity.** Three failure modes — malformed `zlib.error`, oversized inflated payload (bomb), and non-spec compression flags — all surface as **errors** (not warnings) on the result envelope. Each is "we found an XMP iTXt chunk and couldn't decode it" — the same severity as the extractor's malformed-XML path. This required plumbing the helper layer to return `(packet, warnings, errors)` 3-tuples instead of `(packet, warnings)` 2-tuples; the extractor merges both into the result.
+
+The original v0.1 framing was "skip + warn" with a "keep zlib decode complexity out of the path" rationale. That framing was wrong on the costs — `zlib` is stdlib, not a dep — and incomplete on the threats — adding decompression without a bomb cap would have been a regression vs. skip-with-warn. The bounded-decompress approach makes the PNG XMP host-format path feature-complete *and* keeps it safe against adversarial input.
 
 ### Extended XMP: warn-and-parse-main-only
 
@@ -105,9 +111,17 @@ Reasoning, in priority order:
 2. **Multi-packet support adds plumbing.** Locating + verifying + parsing + merging a second packet is meaningful work; the implementation surface roughly doubles for a feature with marginal real-world value.
 3. **The warning makes the limitation visible.** A consumer that sees the warning and needs the extended data knows to look elsewhere.
 
-### Malformed XML: error-in-result, not raise
+### Failed-decode paths: error-in-result, not raise
 
-When `defusedxml.ElementTree.fromstring` raises `xml.etree.ElementTree.ParseError` (malformed XML) or `defusedxml.DefusedXmlException` (security rejection), `extract` catches both and returns an `ExtractorResult` with an error string in the `errors` tuple — *not* a raised `CorruptMetadataError`.
+The XMP extractor has four decode-failure paths, all of which surface as **errors** on the result envelope (not raised exceptions, not warnings):
+
+- `defusedxml.DefusedXmlException` — XXE / DTD / external-entity rejection.
+- `xml.etree.ElementTree.ParseError` — malformed XML.
+- `zlib.error` from `_read_itxt_xmp` — malformed compressed iTXt stream.
+- Decompression-bomb cap exceeded — inflated payload would exceed `_MAX_DECOMPRESSED_XMP_BYTES`.
+- Non-spec PNG compression flag — chunk shape we can't decode.
+
+All four mean "we found an XMP-shaped chunk but couldn't extract content from it" — same severity tier. Surfacing them uniformly as `errors` lets consumers grep one field for parse failures regardless of which layer (host-format walker vs XML parser) caught them.
 
 This deviates from a strict reading of [ADR 0006](0006-custom-exception-hierarchy.md), which describes `CorruptMetadataError` as the right class for "metadata block exists but cannot be parsed". The implementation chose error-in-result for consistency with the EXIF and IPTC patterns:
 
@@ -128,15 +142,17 @@ If anyone ever swaps `defusedxml.ElementTree.fromstring` for the stdlib `xml.etr
 ## Consequences
 
 - ✅ **XXE-safe by default.** No opt-in hardening to forget; the import line is the gate.
+- ✅ **Decompression-bomb-safe.** `decompressobj` + `max_length` caps inflated output at 16 MB; suspected bombs are rejected without allocating the full payload. Parallel to ADR 0007's Pillow `MAX_IMAGE_PIXELS` gate.
 - ✅ **Drop-in compatibility with stdlib `Element`.** Flattening logic doesn't bind to a specific parser.
 - ✅ **Per-format dispatch is small and additive.** Adding TIFF or another host format is a new walker plus a dispatcher arm; no rework of the flattening layer.
-- ✅ **Friendly-prefix subset surface is reviewable in 6 lines.** Adding a namespace is one entry in the map.
-- ✅ **Compressed iTXt is supported transparently.** PNG XMP host-format path is feature-complete; malformed compressed streams surface as a warning instead of crashing or silently returning nothing.
-- ✅ **Vendor-namespace drops are visible.** A single batched warning lists the URIs whose properties were unsurfaced — a user with Lightroom-develop XMP knows the data was present but our friendly map didn't cover it.
+- ✅ **Compressed iTXt is supported.** PNG XMP host-format path is feature-complete; failed-decode cases (malformed zlib, bomb-detected, unrecognized flag) surface as errors at the same severity as malformed XML.
+- ✅ **Vendor-namespace drops are visible.** A batched warning lists the URIs whose properties were unsurfaced — a user with Lightroom-develop XMP knows the data was present but our friendly map didn't cover it.
+- ✅ **Duplicate-field overwrites are visible.** A second batched warning lists the `(prefix, field)` pairs that were silently overwritten by a later `<rdf:Description>`.
 - ✅ **Structured properties (`exif:Flash`, etc.) flatten to a dict.** Previously they silently became empty strings; consumers get usable data now.
+- ✅ **Friendly-prefix subset surface is reviewable in 6 lines.** Adding a namespace is one entry in the map.
 - ❌ **Extended XMP is unsupported.** Files with extended packets see only the main one. Acceptable since main-packet content covers the photo-editor-visible fields.
 - ❌ **Structured values inside Bag/Seq/Alt containers flatten to empty strings.** Documented as a v0.1 limitation; recursion into nested-Description-inside-li would double the flattening surface.
-- ❌ **Malformed-XML path doesn't raise `CorruptMetadataError`.** Inconsistent with a strict reading of ADR 0006; consistent with the EXIF + IPTC implementations. The class is defined but unused project-wide — separate cleanup either way.
+- ❌ **Failed-decode paths don't raise `CorruptMetadataError`.** Inconsistent with a strict reading of ADR 0006; consistent with the EXIF + IPTC implementations. The class is defined but unused project-wide — separate cleanup either way.
 - 🔄 **Reconsider extended XMP** if a real consumer needs thumbnails-or-history from the second packet. The segment-walker can be extended to locate-and-merge.
 - 🔄 **Reconsider TIFF host-format support** when TIFF support overall is added. Tag 700 is the standard location.
 - 🔄 **Reconsider the friendly-prefix map** if a real workflow wants Lightroom-develop or another vendor namespace surfaced. Adding a prefix is one map entry; no logic change.
