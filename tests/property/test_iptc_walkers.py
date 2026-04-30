@@ -47,11 +47,17 @@ def test_iter_segments_never_raises(data: bytes) -> None:
 
 @given(data=_arbitrary_bytes)
 def test_iter_segments_payloads_within_input(data: bytes) -> None:
-    """Every yielded payload is a slice of the original buffer — no
+    """Every yielded payload is a substring of the original buffer — no
     fabricated bytes, no out-of-bounds reads. Hypothesis-fuzzed equivalent
-    of the hand-written truncation tests."""
+    of the hand-written truncation tests.
+
+    Empty payloads are explicitly allowed (a length-2 segment header has
+    no payload bytes). The substring-search property degenerates for
+    empty bytes — ``b"" in anything`` is always True — so we gate the
+    substring check on ``len(payload) > 0`` to avoid the test trivially
+    passing on the empty-payload case."""
     for _marker, payload in _iter_segments(data):
-        assert payload in data
+        assert len(payload) == 0 or payload in data
 
 
 @given(data=_arbitrary_bytes)
@@ -68,9 +74,11 @@ def test_iter_irbs_never_raises(data: bytes) -> None:
 
 @given(data=_arbitrary_bytes)
 def test_iter_irbs_blocks_within_input(data: bytes) -> None:
-    """Every yielded data block is a slice of the original buffer."""
+    """Every yielded data block is a substring of the original buffer.
+    Empty blocks (data_size == 0) are gated out of the substring check
+    for the same reason as the segment walker (see above)."""
     for _resource_id, block in _iter_irbs(data):
-        assert block in data
+        assert len(block) == 0 or block in data
 
 
 @given(data=_arbitrary_bytes)
@@ -86,7 +94,9 @@ def test_iter_iim_records_never_raises(data: bytes) -> None:
 
 @given(data=_arbitrary_bytes)
 def test_iter_iim_records_values_within_input(data: bytes) -> None:
-    """Every yielded value is a slice of the original buffer — same
-    out-of-bounds-protection property as the other two walkers."""
+    """Every yielded value is a substring of the original buffer — same
+    out-of-bounds-protection property as the other two walkers. Zero-length
+    values (legal in IIM — some datasets are flag-only) are gated out for
+    the same reason as the other walkers (see above)."""
     for _record, _dataset, value in _iter_iim_records(data):
-        assert value in data
+        assert len(value) == 0 or value in data

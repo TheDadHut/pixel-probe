@@ -199,6 +199,16 @@ def test_decode_uses_replace_on_bad_bytes() -> None:
     assert "�" in decoded
 
 
+def test_decode_falls_back_on_unknown_codec() -> None:
+    """An unrecognised codec name doesn't raise — falls back to UTF-8 with
+    replacement. Today ``_resolve_charset`` only ever returns ``"utf-8"``,
+    so this branch is unreachable from normal flow; the guard exists so a
+    future extension to the charset map can't crash the parser. Defensive
+    tests for unreachable-today branches catch regressions early if the
+    invariant changes."""
+    assert _decode(b"hello", "definitely-not-a-real-codec") == "hello"
+
+
 # ---------------------------------------------------------------------------
 # Helper unit tests — _iter_segments
 # ---------------------------------------------------------------------------
@@ -492,6 +502,23 @@ def test_iptc_tag_table_no_overlapping_keys() -> None:
     dict, but a regression guard if the table grows."""
     keys = list(IPTC_TAGS.keys())
     assert len(keys) == len(set(keys))
+
+
+def test_repeatable_and_scalar_tags_have_disjoint_names() -> None:
+    """If a friendly name appears under both a repeatable and a non-repeatable
+    ``(record, dataset)`` key, the dispatch in ``extract`` would crash:
+    ``data.setdefault(name, [])`` returns the existing scalar string, and
+    ``.append()`` on a ``str`` raises ``AttributeError``. Today only
+    ``Keywords`` is repeatable, so this is true by construction — the test
+    guards against drift if more datasets get added to either table."""
+    from pixel_probe.core.extractors.iptc import _REPEATABLE_TAGS
+
+    repeatable_names = {IPTC_TAGS[k] for k in _REPEATABLE_TAGS if k in IPTC_TAGS}
+    scalar_names = {IPTC_TAGS[k] for k in IPTC_TAGS if k not in _REPEATABLE_TAGS}
+    assert repeatable_names.isdisjoint(scalar_names), (
+        f"Friendly tag names overlap between repeatable and scalar groups: "
+        f"{repeatable_names & scalar_names}"
+    )
 
 
 def test_no_charset_record_uses_default_utf8(tmp_path: Path) -> None:

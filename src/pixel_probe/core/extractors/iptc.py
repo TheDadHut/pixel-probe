@@ -112,6 +112,14 @@ IPTC_TAGS: Final[dict[tuple[int, int], str]] = {
 
 #: (record, dataset) pairs that may appear multiple times in one file.
 #: These accumulate into ``list[str]`` in the result instead of overwriting.
+#:
+#: Per the IIM spec, several other datasets are also repeatable —
+#: ``(2, 27)`` ContentLocationCode, ``(2, 28)`` ContentLocationName,
+#: ``(2, 75)`` ObjectAttributeReference. None are in :data:`IPTC_TAGS`
+#: today; if you add one, add it here too. The
+#: ``test_repeatable_and_scalar_tags_have_disjoint_names`` regression
+#: test guards against the silent-overwrite case where a repeatable
+#: dataset shares a friendly name with a non-repeatable one.
 _REPEATABLE_TAGS: Final[frozenset[tuple[int, int]]] = frozenset({(2, 25)})
 
 
@@ -231,8 +239,17 @@ def _decode(value: bytes, codec: str) -> str:
     can't kill the rest of the parse. IPTC text in the wild is sometimes
     double-encoded or contains stray bytes; replacement is a more useful
     failure mode than dropping the tag entirely.
+
+    An unrecognised codec name falls back to UTF-8 with replacement
+    rather than letting ``LookupError`` propagate.
+    :func:`_resolve_charset` only ever returns ``"utf-8"`` today, so this
+    branch is unreachable from normal flow — the guard exists so a future
+    extension to the charset map can't crash the parser.
     """
-    return value.decode(codec, errors="replace").rstrip("\x00")
+    try:
+        return value.decode(codec, errors="replace").rstrip("\x00")
+    except LookupError:
+        return value.decode("utf-8", errors="replace").rstrip("\x00")
 
 
 class IptcExtractor(Extractor[IptcData]):
@@ -254,11 +271,15 @@ class IptcExtractor(Extractor[IptcData]):
     def extract(self, path: Path) -> ExtractorResult[IptcData]:
         if not path.is_file():
             raise MissingFileError(f"Not a file: {path}")
-        if path.stat().st_size > MAX_FILE_SIZE_BYTES:
-            raise FileTooLargeError(
-                f"{path} is {path.stat().st_size:,} bytes; max is {MAX_FILE_SIZE_BYTES:,}"
-            )
+        size = path.stat().st_size
+        if size > MAX_FILE_SIZE_BYTES:
+            raise FileTooLargeError(f"{path} is {size:,} bytes; max is {MAX_FILE_SIZE_BYTES:,}")
 
+        # IPTC blocks live in the first ~64 KB of a JPEG (right after SOI);
+        # the whole-file load is wasteful for that purpose but bounded by
+        # MAX_FILE_SIZE_BYTES (500 MB). Streaming through a windowed reader
+        # would be more memory-efficient but adds complexity v0.1 doesn't
+        # need — revisit if profiling shows pressure here.
         raw = path.read_bytes()
         data: IptcData = {}
 
