@@ -175,13 +175,14 @@ class ExifExtractor(Extractor[ExifData]):
             with Image.open(path) as img:
                 exif = img.getexif()
         except UnidentifiedImageError:
+            # Zero-data failure: extractor produces nothing for non-images.
+            # data=None + error per ADR 0011's normalization.
             return ExtractorResult(
                 self.name,
-                data,
-                warnings=("File is not a recognized image format",),
+                errors=("File is not a recognized image format",),
             )
         except Exception as e:  # noqa: BLE001 - whole-file failure → one error, not a crash
-            return ExtractorResult(self.name, data, errors=(f"{type(e).__name__}: {e}",))
+            return ExtractorResult(self.name, errors=(f"{type(e).__name__}: {e}",))
 
         if not exif:
             return ExtractorResult(self.name, data)

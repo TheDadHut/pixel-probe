@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,7 @@ import pytest
 from pixel_probe.core.analyzer import AnalysisResult, Analyzer
 from pixel_probe.core.extractors.base import Extractor, ExtractorResult
 from pixel_probe.core.extractors.file_info import FileInfoExtractor
-from pixel_probe.exceptions import PixelProbeError
+from pixel_probe.exceptions import MissingFileError, PixelProbeError
 
 from .conftest import fixture_path
 
@@ -93,15 +94,48 @@ def test_exception_in_one_extractor_does_not_kill_others() -> None:
     assert result.results["last"].has_data
 
 
-def test_exception_message_includes_type_name() -> None:
-    """Error messages preserve the exception class — that's part of the
-    debuggability contract for whoever reads the result downstream."""
+def test_unexpected_exception_message_includes_bug_prefix() -> None:
+    """Per ADR 0011, exceptions that aren't ``PixelProbeError`` subclasses
+    indicate a programming bug. The orchestrator catches them, logs the
+    traceback, and surfaces as an error with a ``"BUG: "`` prefix so
+    consumers can tell the difference between expected extractor failures
+    and actual bugs."""
     analyzer = Analyzer([_RaisingExtractor("boom", FileNotFoundError("missing.jpg"))])
     result = analyzer.analyze(fixture_path("tiny.jpg"))
 
-    msg = result.results["boom"].errors[0]
-    assert msg.startswith("FileNotFoundError:")
-    assert "missing.jpg" in msg
+    entry = result.results["boom"]
+    assert entry.data is None
+    assert entry.errors[0].startswith("BUG: FileNotFoundError:")
+    assert "missing.jpg" in entry.errors[0]
+
+
+def test_unexpected_exception_logs_traceback(caplog: pytest.LogCaptureFixture) -> None:
+    """The bug-bucket path must call ``logger.exception()`` so the traceback
+    surfaces in operator log handlers. Without this, a future refactor that
+    accidentally drops the logging call would leave bugs invisible — the
+    error string would still ship, but the actionable traceback wouldn't."""
+    analyzer = Analyzer([_RaisingExtractor("boom", FileNotFoundError("missing.jpg"))])
+    with caplog.at_level(logging.ERROR, logger="pixel_probe.core.analyzer"):
+        analyzer.analyze(fixture_path("tiny.jpg"))
+
+    assert any("Unexpected exception" in r.message for r in caplog.records)
+    # exc_info is the load-bearing assertion: logger.exception attaches the
+    # active exception's traceback, not just an error-level message. Test
+    # passes for plain logger.error, fails only if the call is dropped or
+    # downgraded to a no-traceback variant.
+    assert any(r.exc_info is not None for r in caplog.records)
+
+
+def test_pixel_probe_error_message_lacks_bug_prefix() -> None:
+    """Expected extractor failures (PixelProbeError subclasses) don't get
+    the BUG: prefix — they're known failure modes, not surprises."""
+    analyzer = Analyzer([_RaisingExtractor("boom", MissingFileError("not there"))])
+    result = analyzer.analyze(fixture_path("tiny.jpg"))
+
+    entry = result.results["boom"]
+    assert entry.data is None
+    assert entry.errors[0].startswith("MissingFileError:")
+    assert not entry.errors[0].startswith("BUG:")
 
 
 def test_keyboard_interrupt_propagates() -> None:
