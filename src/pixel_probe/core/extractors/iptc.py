@@ -52,7 +52,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Final
+from typing import Final
 
 from pixel_probe.exceptions import FileTooLargeError, MissingFileError
 
@@ -61,10 +61,13 @@ from .file_info import MAX_FILE_SIZE_BYTES
 
 __all__ = ["IPTC_TAGS", "IptcData", "IptcExtractor"]
 
-#: Type alias for the IPTC payload. Like EXIF, IIM is a sparse tag soup —
-#: ``dict[str, Any]`` is honest about the dynamism. Values are ``str`` for
-#: scalar tags and ``list[str]`` for repeatable tags (Keywords).
-IptcData = dict[str, Any]
+#: Type alias for the IPTC payload. Unlike EXIF (whose values can be
+#: numbers, tuples, and nested sub-dicts), every IIM dataset we surface is
+#: textual: scalar tags become ``str`` and repeatable tags (Keywords)
+#: become ``list[str]``. The tighter ``dict[str, str | list[str]]`` keeps
+#: that contract visible to type-checkers and downstream consumers.
+#: See ADR 0003 — this matches its prediction exactly.
+IptcData = dict[str, str | list[str]]
 
 # JPEG markers
 _SOI: Final = b"\xff\xd8"
@@ -317,8 +320,16 @@ class IptcExtractor(Extractor[IptcData]):
                 continue
             decoded = _decode(val, codec)
             if key in _REPEATABLE_TAGS:
-                bucket = data.setdefault(tag_name, [])
-                bucket.append(decoded)
+                # Either ``None`` (first occurrence) or an existing ``list[str]``
+                # by the disjointness invariant in
+                # ``test_repeatable_and_scalar_tags_have_disjoint_names`` —
+                # a repeatable tag's friendly name never collides with a
+                # scalar tag's, so the existing value can't be a ``str``.
+                existing = data.get(tag_name)
+                if isinstance(existing, list):
+                    existing.append(decoded)
+                else:
+                    data[tag_name] = [decoded]
             else:
                 data[tag_name] = decoded
 
