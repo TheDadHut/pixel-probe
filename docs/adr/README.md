@@ -15,6 +15,7 @@ Format: [MADR](https://adr.github.io/madr/) (Status / Context / Decision / Conse
 - [0007 — Adversarial input handling](0007-adversarial-input-handling.md)
 - [0008 — EXIF parsing strategy](0008-exif-parsing-strategy.md)
 - [0009 — IPTC parser design](0009-iptc-parser-design.md)
+- [0010 — XMP parser design](0010-xmp-parser-design.md)
 
 ## When to write a new ADR
 

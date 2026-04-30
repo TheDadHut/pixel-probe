@@ -23,6 +23,7 @@ from defusedxml.ElementTree import fromstring
 
 from pixel_probe.core.analyzer import Analyzer
 from pixel_probe.core.extractors.xmp import (
+    _MAX_DECOMPRESSED_XMP_BYTES,
     XmpExtractor,
     _find_xmp_packet,
     _find_xmp_packet_jpeg,
@@ -46,12 +47,16 @@ from .conftest import fixture_path
 
 def test_parses_dc_title_alt() -> None:
     """``dc:title`` is encoded as ``<rdf:Alt>`` with language alternatives.
-    The flattener picks ``x-default`` and surfaces it as a plain string."""
+    The flattener picks ``x-default`` and surfaces it as a plain string.
+
+    The fixture deliberately includes a ``vendor:OutOfScope`` element from
+    an unsurfaced namespace to verify the dropped-namespace warning fires
+    in real fixture loads — see ``test_unknown_namespace_dropped_with_warning``
+    for the warning's exact shape."""
     result = XmpExtractor().extract(fixture_path("xmp_basic.jpg"))
 
     assert result.extractor_name == "xmp"
     assert result.errors == ()
-    assert result.warnings == ()
     assert result.has_data
     assert result.data["dc"]["title"] == "XMP Sample Title"
 
@@ -82,11 +87,12 @@ def test_simple_text_properties() -> None:
     assert result.data["photoshop"]["Headline"] == "Sample headline"
 
 
-def test_unknown_namespace_silently_dropped() -> None:
+def test_unknown_namespace_dropped_with_warning() -> None:
     """Properties from namespaces not in :data:`_NAMESPACE_PREFIXES` are
-    dropped — the fixture deliberately includes a ``vendor:OutOfScope``
-    element to verify this. No warning, no error: the property was simply
-    ignored."""
+    dropped from ``data`` — the fixture deliberately includes a
+    ``vendor:OutOfScope`` element to verify this — but the namespace URI
+    surfaces in the warnings list so the omission is visible to consumers
+    rather than being a silent miss."""
     result = XmpExtractor().extract(fixture_path("xmp_basic.jpg"))
 
     assert "vendor" not in result.data
@@ -95,6 +101,9 @@ def test_unknown_namespace_silently_dropped() -> None:
     for ns_data in result.data.values():
         for value in ns_data.values():
             assert "should be dropped" not in (value if isinstance(value, str) else " ".join(value))
+    # The warning is the user-visible signal that something was dropped.
+    assert any("vendor/1.0/" in w for w in result.warnings)
+    assert any("unsurfaced namespace" in w for w in result.warnings)
 
 
 def test_returns_empty_for_image_without_xmp() -> None:
@@ -247,24 +256,75 @@ def test_extended_xmp_warns(tmp_path: Path) -> None:
     assert any("Extended XMP" in w for w in result.warnings)
 
 
-def test_compressed_png_itxt_surfaces_warning(tmp_path: Path) -> None:
-    """End-to-end: a PNG with a compressed iTXt XMP chunk returns empty
-    data + a warning so the user sees why nothing was parsed. Replaces
-    what was previously a silent miss; without the warning, a compressed-
-    XMP PNG looked indistinguishable from a no-XMP PNG."""
+def test_compressed_png_itxt_decompresses_end_to_end(tmp_path: Path) -> None:
+    """End-to-end: a PNG with a compressed iTXt XMP chunk is decompressed
+    via stdlib ``zlib`` and the inflated XMP parsed normally. Surfaces no
+    warning in the success path — the user shouldn't care that the
+    container happened to be compressed."""
     # Build a minimal PNG that's just signature + a compressed-iTXt chunk
     # (no IHDR — our walker doesn't validate chunk order, only chunk
     # structure, so this is enough to drive the path).
-    compressed = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00<garbage compressed text>"
-    chunk = _build_png_chunk(b"iTXt", compressed)
+    real_xmp = (
+        b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        b'<rdf:Description rdf:about=""'
+        b'  xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        b"<dc:title>"
+        b'<rdf:Alt><rdf:li xml:lang="x-default">Compressed XMP</rdf:li></rdf:Alt>'
+        b"</dc:title>"
+        b"</rdf:Description>"
+        b"</rdf:RDF>"
+        b"</x:xmpmeta>"
+    )
+    compressed_xmp = zlib.compress(real_xmp)
+    payload = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00" + compressed_xmp
+    chunk = _build_png_chunk(b"iTXt", payload)
     out = tmp_path / "compressed.png"
     out.write_bytes(_PNG_SIGNATURE + chunk)
 
     result = XmpExtractor().extract(out)
 
-    assert result.data == {}
     assert result.errors == ()
-    assert any("Compressed XMP" in w for w in result.warnings)
+    assert result.warnings == ()
+    assert result.data["dc"]["title"] == "Compressed XMP"
+
+
+def test_compressed_png_itxt_malformed_surfaces_error(tmp_path: Path) -> None:
+    """End-to-end: a PNG whose compressed iTXt body isn't a valid zlib
+    stream surfaces an error on the result envelope rather than crashing
+    or silently returning empty. Severity is error (not warning) — same
+    severity as the malformed-XML path, since both are "we found a chunk
+    but couldn't decode it"."""
+    payload = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00not zlib at all"
+    chunk = _build_png_chunk(b"iTXt", payload)
+    out = tmp_path / "malformed.png"
+    out.write_bytes(_PNG_SIGNATURE + chunk)
+
+    result = XmpExtractor().extract(out)
+
+    assert result.data == {}
+    assert result.warnings == ()
+    assert any("Malformed compressed" in e for e in result.errors)
+
+
+def test_compressed_png_itxt_bomb_surfaces_error(tmp_path: Path) -> None:
+    """End-to-end zlib-bomb defense: a PNG with a tiny compressed iTXt that
+    inflates past ``_MAX_DECOMPRESSED_XMP_BYTES`` is rejected without
+    allocating the full output. Surfaces as an error so the security gate
+    is visible to consumers, parallel to the malformed-XML path. Without
+    this cap, a malicious PNG could trigger OOM during decompression."""
+    bomb_payload = b"a" * (_MAX_DECOMPRESSED_XMP_BYTES + 1024)
+    compressed = zlib.compress(bomb_payload)
+    payload = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00" + compressed
+    chunk = _build_png_chunk(b"iTXt", payload)
+    out = tmp_path / "bomb.png"
+    out.write_bytes(_PNG_SIGNATURE + chunk)
+
+    result = XmpExtractor().extract(out)
+
+    assert result.data == {}
+    assert result.warnings == ()
+    assert any("decompression bomb" in e.lower() for e in result.errors)
 
 
 # ---------------------------------------------------------------------------
@@ -524,8 +584,9 @@ def test_flatten_xmp_attributes_on_description() -> None:
         "</x:xmpmeta>"
     )
     root = fromstring(xml)
-    data = _flatten_xmp(root)
+    data, warnings = _flatten_xmp(root)
     assert data == {"dc": {"title": "Attribute form"}}
+    assert warnings == []
 
 
 def test_flatten_xmp_bare_rdf_root_works() -> None:
@@ -541,7 +602,9 @@ def test_flatten_xmp_bare_rdf_root_works() -> None:
         "</rdf:RDF>"
     )
     root = fromstring(xml)
-    assert _flatten_xmp(root) == {"dc": {"title": "Bare RDF"}}
+    data, warnings = _flatten_xmp(root)
+    assert data == {"dc": {"title": "Bare RDF"}}
+    assert warnings == []
 
 
 def test_flatten_xmp_no_rdf_root_returns_empty() -> None:
@@ -549,12 +612,14 @@ def test_flatten_xmp_no_rdf_root_returns_empty() -> None:
     yields empty data — defensive for malformed-but-parseable XML."""
     xml = "<root><meta>no rdf here</meta></root>"
     root = fromstring(xml)
-    assert _flatten_xmp(root) == {}
+    assert _flatten_xmp(root) == ({}, [])
 
 
-def test_flatten_xmp_unknown_attribute_namespace_dropped() -> None:
+def test_flatten_xmp_unknown_attribute_namespace_dropped_with_warning() -> None:
     """An attribute from a vendor namespace not in our prefix map is
-    silently dropped. Parity with the element-side behavior."""
+    dropped from the data dict, but the namespace URI surfaces in the
+    warnings list — visible to consumers expecting that field. Same
+    pattern for element-form drops."""
     xml = (
         '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
         '<rdf:Description rdf:about=""'
@@ -565,8 +630,81 @@ def test_flatten_xmp_unknown_attribute_namespace_dropped() -> None:
         "</rdf:RDF>"
     )
     root = fromstring(xml)
-    data = _flatten_xmp(root)
+    data, warnings = _flatten_xmp(root)
     assert data == {"dc": {"title": "Real title"}}
+    assert len(warnings) == 1
+    assert "vendor/1.0/" in warnings[0]
+    assert "1 unsurfaced namespace" in warnings[0]
+
+
+def test_flatten_xmp_bookkeeping_namespaces_excluded_from_warning() -> None:
+    """RDF / XML / xmpNote bookkeeping namespaces don't generate the
+    dropped-namespace warning — they don't carry user metadata that
+    would have been surfaced under a friendly prefix. Only namespaces
+    that *would* have been useful (vendor / extension schemas) trigger
+    the warning. This case covers attribute-form bookkeeping; the
+    element-form variant is exercised below."""
+    xml = (
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about=""'
+        '  xmlns:dc="http://purl.org/dc/elements/1.1/"'
+        '  xmlns:xmpNote="http://ns.adobe.com/xmp/note/"'
+        '  dc:title="Clean title"'
+        '  xmpNote:HasExtendedXMP="abc" />'
+        "</rdf:RDF>"
+    )
+    root = fromstring(xml)
+    data, warnings = _flatten_xmp(root)
+    assert data == {"dc": {"title": "Clean title"}}
+    # rdf:about and xmpNote:HasExtendedXMP are bookkeeping; warning stays empty.
+    assert warnings == []
+
+
+def test_flatten_xmp_duplicate_field_overwrite_surfaces_warning() -> None:
+    """Two ``<rdf:Description>`` blocks both defining ``dc:title`` →
+    later wins, but the overwrite surfaces a warning so the silent-
+    overwrite policy is visible. Real-world XMP rarely has duplicates
+    (Description blocks split by namespace), so this fires only on
+    pathological input — but when it does, the warning is the user's
+    only signal that they're seeing one of two definitions."""
+    xml = (
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about=""'
+        '  xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        "<dc:title>First definition</dc:title>"
+        "</rdf:Description>"
+        '<rdf:Description rdf:about=""'
+        '  xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        "<dc:title>Second definition (wins)</dc:title>"
+        "</rdf:Description>"
+        "</rdf:RDF>"
+    )
+    root = fromstring(xml)
+    data, warnings = _flatten_xmp(root)
+    assert data == {"dc": {"title": "Second definition (wins)"}}
+    assert any("dc:title" in w for w in warnings)
+    assert any("overwrote" in w for w in warnings)
+
+
+def test_flatten_xmp_bookkeeping_element_excluded_from_warning() -> None:
+    """Element-form parity for the bookkeeping-namespace exclusion.
+    A child element from ``xmpNote`` (the ExtendedXMP marker carrier)
+    should not surface a dropped-namespace warning — same policy as
+    the attribute-form case."""
+    xml = (
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about=""'
+        '  xmlns:dc="http://purl.org/dc/elements/1.1/"'
+        '  xmlns:xmpNote="http://ns.adobe.com/xmp/note/">'
+        "<dc:title>Clean</dc:title>"
+        "<xmpNote:HasExtendedXMP>abc</xmpNote:HasExtendedXMP>"
+        "</rdf:Description>"
+        "</rdf:RDF>"
+    )
+    root = fromstring(xml)
+    data, warnings = _flatten_xmp(root)
+    assert data == {"dc": {"title": "Clean"}}
+    assert warnings == []
 
 
 # ---------------------------------------------------------------------------
@@ -575,9 +713,9 @@ def test_flatten_xmp_unknown_attribute_namespace_dropped() -> None:
 
 
 def test_find_xmp_packet_unknown_format_returns_none() -> None:
-    """Bytes that match neither JPEG SOI nor the PNG signature → ``(None, [])``."""
-    assert _find_xmp_packet(b"GIF89a...some random bytes") == (None, [])
-    assert _find_xmp_packet(b"") == (None, [])
+    """Bytes that match neither JPEG SOI nor the PNG signature → ``(None, [], [])``."""
+    assert _find_xmp_packet(b"GIF89a...some random bytes") == (None, [], [])
+    assert _find_xmp_packet(b"") == (None, [], [])
 
 
 def test_find_xmp_packet_jpeg_no_xmp_returns_none() -> None:
@@ -702,7 +840,7 @@ def test_find_xmp_packet_png_chunk_data_overruns_buffer() -> None:
         + b"abcd"  # any chunk type
         + b"xxxx"  # 4 dummy bytes — enough to satisfy the outer 20-byte threshold
     )
-    assert _find_xmp_packet_png(overrun) == (None, [])
+    assert _find_xmp_packet_png(overrun) == (None, [], [])
 
 
 # ---------------------------------------------------------------------------
@@ -726,40 +864,88 @@ _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def test_find_xmp_packet_png_no_xmp_returns_none() -> None:
-    """A PNG with no XMP iTXt chunk → ``(None, [])``."""
-    assert _find_xmp_packet_png(_PNG_SIGNATURE) == (None, [])
+    """A PNG with no XMP iTXt chunk → ``(None, [], [])``."""
+    assert _find_xmp_packet_png(_PNG_SIGNATURE) == (None, [], [])
 
 
 def test_find_xmp_packet_png_handles_truncated_chunk() -> None:
-    """A chunk header declaring more data than remains → ``(None, [])``, no crash."""
+    """A chunk header declaring more data than remains → ``(None, [], [])``, no crash."""
     truncated = _PNG_SIGNATURE + (9999).to_bytes(4, "big") + b"iTXt" + b"abc"
-    assert _find_xmp_packet_png(truncated) == (None, [])
+    assert _find_xmp_packet_png(truncated) == (None, [], [])
 
 
-def test_find_xmp_packet_png_skips_compressed_xmp_with_warning() -> None:
-    """An iTXt chunk with compression-flag=1 (compressed text) is skipped
-    rather than decompressed — keeping the dep graph zlib-free. The user
-    sees a warning so "no XMP found" doesn't look like a silent miss."""
+def test_find_xmp_packet_png_decompresses_compressed_xmp() -> None:
+    """An iTXt chunk with compression-flag=1 (zlib) is decompressed via
+    stdlib ``zlib`` and the inflated XMP packet returned. Real-world XMP-PNG
+    files do exist with compressed iTXt; this exercises the success path."""
+    real_xmp = (
+        b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" />'
+        b"</x:xmpmeta>"
+    )
+    compressed_xmp = zlib.compress(real_xmp)
     # iTXt: keyword \0 compression-flag(1) compression-method(0) lang \0 tkw \0 text
-    compressed = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00<garbage compressed text>"
-    chunk = _build_png_chunk(b"iTXt", compressed)
+    payload = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00" + compressed_xmp
+    chunk = _build_png_chunk(b"iTXt", payload)
     png = _PNG_SIGNATURE + chunk
-    packet, warnings = _find_xmp_packet_png(png)
+    packet, warnings, errors = _find_xmp_packet_png(png)
+    assert packet == real_xmp
+    assert warnings == []
+    assert errors == []
+
+
+def test_find_xmp_packet_png_errors_on_malformed_compressed_xmp() -> None:
+    """A compression-flag=1 iTXt whose body isn't valid zlib triggers
+    ``zlib.error``; the walker surfaces an error (not warning) instead of
+    raising — keeps the parse no-crash invariant for adversarial inputs.
+    Severity matches the malformed-XML path: "we found a chunk but
+    couldn't decode it"."""
+    payload = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00not valid zlib data"
+    chunk = _build_png_chunk(b"iTXt", payload)
+    png = _PNG_SIGNATURE + chunk
+    packet, warnings, errors = _find_xmp_packet_png(png)
     assert packet is None
-    assert any("Compressed XMP" in w for w in warnings)
+    assert warnings == []
+    assert any("Malformed compressed" in e for e in errors)
 
 
-def test_find_xmp_packet_png_skips_unknown_compression_flag_with_warning() -> None:
+def test_find_xmp_packet_png_errors_on_unknown_compression_flag() -> None:
     """The PNG iTXt spec defines compression-flag values 0 (uncompressed)
-    and 1 (zlib). Any other value indicates a malformed chunk; we treat
-    it the same as compressed — skip + warn — rather than blindly reading
-    the rest as text. Defensive against malformed inputs."""
+    and 1 (zlib). Any other value indicates a malformed chunk; surface as
+    an error rather than blindly reading the rest as text. Defensive
+    against malformed inputs and parity with the malformed-zlib case."""
     malformed = b"XML:com.adobe.xmp\x00\x07\x00\x00\x00<looks like XMP body>"
     chunk = _build_png_chunk(b"iTXt", malformed)
     png = _PNG_SIGNATURE + chunk
-    packet, warnings = _find_xmp_packet_png(png)
+    packet, warnings, errors = _find_xmp_packet_png(png)
     assert packet is None
-    assert any("Compressed XMP" in w for w in warnings)
+    assert warnings == []
+    assert any("Unrecognized iTXt compression flag" in e for e in errors)
+
+
+def test_find_xmp_packet_png_errors_on_decompression_bomb() -> None:
+    """Defends against the zlib-bomb DoS: a small compressed iTXt whose
+    inflated payload would exceed ``_MAX_DECOMPRESSED_XMP_BYTES``. The
+    walker rejects it via ``decompressobj``'s ``max_length`` cap and
+    ``unconsumed_tail`` check — bomb is detected without allocating the
+    full output. Surfaces as an error so the security gate is visible.
+
+    The bomb payload is constructed by compressing a string longer than
+    the cap; ``zlib.compress`` of repeated bytes has near-1000:1 ratio, so
+    the compressed input is tiny."""
+    bomb_payload = b"a" * (_MAX_DECOMPRESSED_XMP_BYTES + 1024)
+    compressed = zlib.compress(bomb_payload)
+    # Sanity: compressed size is way under the cap (typically <1 KB for ~16 MB
+    # of repeated bytes), so the walker has to actually start decompressing
+    # to encounter the cap — pinning the bomb-detection path.
+    assert len(compressed) < 1024 * 1024  # well under 1 MB
+    payload = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00" + compressed
+    chunk = _build_png_chunk(b"iTXt", payload)
+    png = _PNG_SIGNATURE + chunk
+    packet, warnings, errors = _find_xmp_packet_png(png)
+    assert packet is None
+    assert warnings == []
+    assert any("decompression bomb" in e.lower() for e in errors)
 
 
 def test_find_xmp_packet_png_skips_non_xmp_itxt() -> None:
@@ -769,27 +955,27 @@ def test_find_xmp_packet_png_skips_non_xmp_itxt() -> None:
     payload = b"Author\x00\x00\x00\x00\x00Alice"
     chunk = _build_png_chunk(b"iTXt", payload)
     png = _PNG_SIGNATURE + chunk
-    assert _find_xmp_packet_png(png) == (None, [])
+    assert _find_xmp_packet_png(png) == (None, [], [])
 
 
 def test_read_itxt_xmp_handles_missing_keyword_terminator() -> None:
-    """An iTXt payload with no NUL terminator after the keyword → ``(None, [])``."""
-    assert _read_itxt_xmp(b"XML:com.adobe.xmp_no_nul_here") == (None, [])
+    """An iTXt payload with no NUL terminator after the keyword → ``(None, [], [])``."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp_no_nul_here") == (None, [], [])
 
 
 def test_read_itxt_xmp_handles_truncated_after_keyword() -> None:
-    """An iTXt payload that ends before the compression flags fits → ``(None, [])``."""
-    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00") == (None, [])
+    """An iTXt payload that ends before the compression flags fits → ``(None, [], [])``."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00") == (None, [], [])
 
 
 def test_read_itxt_xmp_handles_missing_lang_terminator() -> None:
-    """An iTXt payload missing the language-tag NUL terminator → ``(None, [])``."""
-    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00\x00\x00xx-no-end") == (None, [])
+    """An iTXt payload missing the language-tag NUL terminator → ``(None, [], [])``."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00\x00\x00xx-no-end") == (None, [], [])
 
 
 def test_read_itxt_xmp_handles_missing_translated_keyword_terminator() -> None:
-    """An iTXt payload missing the translated-keyword NUL terminator → ``(None, [])``."""
-    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00\x00\x00\x00no-end") == (None, [])
+    """An iTXt payload missing the translated-keyword NUL terminator → ``(None, [], [])``."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00\x00\x00\x00no-end") == (None, [], [])
 
 
 # ---------------------------------------------------------------------------
