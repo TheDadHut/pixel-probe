@@ -23,6 +23,7 @@ exercise the same write path Pillow consumers use in production.
 from __future__ import annotations
 
 import hashlib
+import io
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -118,6 +119,105 @@ def _build_exif_none_jpeg(out: Path) -> None:
     img.save(out, format="JPEG", quality=80)
 
 
+# IPTC fixture authoring -----------------------------------------------------
+#
+# Pillow has no high-level writer for IPTC IIM, so we hand-build the APP13 /
+# Photoshop IRB / IIM byte sequence and splice it into a freshly-encoded JPEG
+# right after SOI. The format produced here mirrors what real-world photo
+# software (Photoshop, exiftool, digiKam) writes, and is the same shape that
+# ``pixel_probe.core.extractors.iptc`` parses. See that module's docstring
+# for the full layout reference.
+
+
+def _build_iim_record(record: int, dataset: int, value: bytes) -> bytes:
+    """Encode a single IIM record. Extended-size values are out of scope."""
+    if len(value) >= 0x8000:
+        msg = f"IIM value too large for v1 (use of high bit reserved): {len(value)} bytes"
+        raise ValueError(msg)
+    return bytes([0x1C, record, dataset]) + len(value).to_bytes(2, "big") + value
+
+
+def _build_app13_with_iim(records: list[tuple[int, int, bytes]]) -> bytes:
+    """Build a complete APP13 segment carrying a Photoshop IRB with IPTC IIM."""
+    iim_block = b"".join(_build_iim_record(r, d, v) for r, d, v in records)
+    # IRB data is padded to even length when its declared size is odd.
+    padded = iim_block + (b"\x00" if len(iim_block) % 2 else b"")
+    irb = (
+        b"8BIM"
+        + (0x0404).to_bytes(2, "big")  # resource ID = IPTC IIM
+        + b"\x00\x00"  # zero-length Pascal name + padding to even total
+        + len(iim_block).to_bytes(4, "big")
+        + padded
+    )
+    payload = b"Photoshop 3.0\x00" + irb
+    # APP13 length includes the 2 length bytes themselves.
+    length = len(payload) + 2
+    return b"\xff\xed" + length.to_bytes(2, "big") + payload
+
+
+def _splice_after_soi(jpeg_bytes: bytes, segment: bytes) -> bytes:
+    """Insert ``segment`` immediately after JPEG SOI. Decoders accept any
+    APPn segment in any order before SOS; right-after-SOI is the most
+    conventional placement."""
+    return jpeg_bytes[:2] + segment + jpeg_bytes[2:]
+
+
+def _build_iptc_basic_jpeg(out: Path) -> None:
+    """100x100 JPEG with rich IPTC: title, multi-keyword (3), byline, copyright,
+    and an explicit UTF-8 charset escape so the parser exercises the
+    ``CodedCharacterSet`` resolution path."""
+    img = Image.new("RGB", (100, 100), color=(50, 100, 150))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80)
+    base = buf.getvalue()
+
+    records: list[tuple[int, int, bytes]] = [
+        (1, 90, b"\x1b%G"),  # CodedCharacterSet → UTF-8
+        (2, 5, b"Sample IPTC Title"),
+        (2, 25, b"alpha"),  # Keywords (repeatable)
+        (2, 25, b"beta"),
+        (2, 25, b"gamma"),
+        (2, 80, b"Test Author"),
+        (2, 116, "© 2026 TestCorp".encode()),  # explicitly UTF-8 to exercise non-ASCII
+    ]
+    out.write_bytes(_splice_after_soi(base, _build_app13_with_iim(records)))
+
+
+def _build_iptc_none_jpeg(out: Path) -> None:
+    """100x100 JPEG explicitly without any IPTC block."""
+    img = Image.new("RGB", (100, 100), color=(150, 100, 50))
+    img.save(out, format="JPEG", quality=80)
+
+
+def _build_iptc_corrupt_jpeg(out: Path) -> None:
+    """100x100 JPEG whose IIM record declares a value-size 9999 bytes long
+    when only ~9 follow. The IRB itself is well-formed; only the IIM walker
+    encounters the corruption. The parser must detect the bounds violation
+    and stop cleanly without raising — exercising the ``end > n`` guard
+    in :func:`_iter_iim_records`."""
+    img = Image.new("RGB", (100, 100), color=(120, 120, 120))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80)
+    base = buf.getvalue()
+
+    # 0x1C 02 05 (Title) + declared size 9999 + only 9 bytes of value.
+    # The IRB declares its data size accurately (the parser advances past
+    # this whole block correctly); only the inner IIM walk hits the lie.
+    iim_corrupt = bytes([0x1C, 0x02, 0x05]) + (9999).to_bytes(2, "big") + b"truncated"
+    padded = iim_corrupt + (b"\x00" if len(iim_corrupt) % 2 else b"")
+    irb = (
+        b"8BIM"
+        + (0x0404).to_bytes(2, "big")
+        + b"\x00\x00"
+        + len(iim_corrupt).to_bytes(4, "big")
+        + padded
+    )
+    payload = b"Photoshop 3.0\x00" + irb
+    length = len(payload) + 2
+    app13 = b"\xff\xed" + length.to_bytes(2, "big") + payload
+    out.write_bytes(_splice_after_soi(base, app13))
+
+
 def main() -> int:
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
     builders: list[tuple[str, Callable[[Path], None]]] = [
@@ -127,6 +227,9 @@ def main() -> int:
         ("exif_rich.jpg", _build_exif_rich_jpeg),
         ("exif_with_gps.jpg", _build_exif_with_gps_jpeg),
         ("exif_none.jpg", _build_exif_none_jpeg),
+        ("iptc_basic.jpg", _build_iptc_basic_jpeg),
+        ("iptc_none.jpg", _build_iptc_none_jpeg),
+        ("iptc_corrupt.jpg", _build_iptc_corrupt_jpeg),
     ]
     print(f"Writing fixtures to {FIXTURES_DIR}")
     for name, build in builders:

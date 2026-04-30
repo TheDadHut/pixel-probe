@@ -19,6 +19,9 @@ Each fixture below documents: filename, content summary, origin/license, and exp
 | `exif_rich.jpg` | 2 | Generated (`scripts/build_fixtures.py`) | 100×100 JPEG with Make/Model + Exif sub-IFD (ExposureTime, FNumber, ISOSpeedRatings, FocalLength, DateTimeOriginal) plus a deliberately oversized 100-byte MakerNote that exercises the bytes-summarization gate | _SHA varies with Pillow encoder; not asserted_ |
 | `exif_with_gps.jpg` | 2 | Generated (`scripts/build_fixtures.py`) | 100×100 JPEG with GPS sub-IFD: 37° 46' 30" N, 122° 25' 15" W | _SHA varies with Pillow encoder; not asserted_ |
 | `exif_none.jpg` | 2 | Generated (`scripts/build_fixtures.py`) | 100×100 JPEG explicitly without an EXIF block | _SHA varies with Pillow encoder; not asserted_ |
+| `iptc_basic.jpg` | 3a | Generated (`scripts/build_fixtures.py`) | 100×100 JPEG with hand-built APP13/Photoshop IRB / IIM: Title, three repeating Keywords (alpha/beta/gamma), Byline, Copyright (with non-ASCII ©). Includes the `\x1b%G` UTF-8 charset escape so the parser exercises CodedCharacterSet resolution. | _SHA varies with Pillow encoder; not asserted_ |
+| `iptc_none.jpg` | 3a | Generated (`scripts/build_fixtures.py`) | 100×100 JPEG explicitly without any IPTC block | _SHA varies with Pillow encoder; not asserted_ |
+| `iptc_corrupt.jpg` | 3a | Generated (`scripts/build_fixtures.py`) | 100×100 JPEG whose IIM record declares value-size 9999 with only ~9 bytes of value — drives the IIM walker's bounds-check path | _SHA varies with Pillow encoder; not asserted_ |
 
 ## Regenerating
 
