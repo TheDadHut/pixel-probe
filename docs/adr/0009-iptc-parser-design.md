@@ -69,13 +69,17 @@ The IIM spec defines hundreds of datasets, the bulk of which are obsolete (ARPA-
 
 Datasets not in the table are silently dropped — no warning, no error. The contract is "we surface useful subset; the rest is intentionally not parsed."
 
-### Extended-size IIM records: fail-stop the walk
+### Extended-size IIM records: deliberate fail-stop
 
-When a record's size field has the high bit set, the IIM spec defines the field as a length-of-length: the next bytes describe how long the actual size field is. v0.1 doesn't decode extended records — but importantly, it can't safely *skip past* one either, because we don't know how many bytes the extended length consumes.
+When a record's size field has the high bit set, the IIM spec defines the lower 15 bits as a *length-of-length* — i.e., "the next N bytes contain the real size", letting values exceed the 32 KB limit of a normal 2-byte size.
 
-The walker terminates on extended-size records. Subsequent records in the same IRB are not parsed. This is a deliberate choice: silently misparsing the rest of the IRB by guessing the extended-record length would be worse than fail-stopping at the first extended record.
+Decoding extended records mechanically is straightforward — maybe 8 lines in `_iter_iim_records` to read the length-of-length field, then the actual size, then the value. We don't do that. The walker terminates on the first extended record; subsequent records in the same IRB are not parsed. The reasoning, in priority order:
 
-In practice, extended records are vanishingly rare — the high bit was reserved for future use that never materialized at scale. Real-world IPTC almost never uses them.
+1. **They're vanishingly rare in real files.** The 0x8000 size flag was specced for embedded raw audio/video as IIM records — a use case that never caught on. Photoshop, Lightroom, Camera Raw, exiftool, and digiKam don't emit them for photo metadata. The chance a v0.1 user feeds us a file with one is effectively zero.
+2. **Their values would almost always be binary blobs.** Photo-editor-visible metadata (the `IPTC_TAGS` subset) is universally text-encoded. Supporting extended records meaningfully would mean porting [ADR 0008](0008-exif-parsing-strategy.md)'s bytes-summarization gate (`<binary, N bytes>`) to IPTC — adding complexity for a tag table whose values are otherwise always strings.
+3. **Fail-stop is safe-but-lossy, not incorrect.** The walker doesn't *misparse* on encountering one — it stops. Whatever was parsed before ships in `data`. A pathological file with an extended record at position 0 would yield empty `data`, but it wouldn't yield wrong `data`. Silently advancing past the extended record by guessing its length-of-length encoding (the only option short of full support) would risk misparsing the rest of the IRB and surfacing fabricated tag values — strictly worse.
+
+The cost of full support is real (parser code + tests + bytes-summarization plumbing); the value for our scope is zero. Fail-stop is the deliberate choice.
 
 ### Repeatable tags and the disjoint-name invariant
 
@@ -103,9 +107,9 @@ The alternative was `errors="strict"` (raise on bad bytes) or `errors="ignore"` 
 - ✅ **Charset resolution is order-agnostic.** Files with the charset escape mid-stream (or absent entirely) are handled correctly, not just the common encoder shape.
 - ✅ **The tag table is reviewable in 15 lines.** Adding a dataset is changing one line in `IPTC_TAGS`, plus adding to `_REPEATABLE_TAGS` if it repeats — the disjointness test catches name collisions.
 - ❌ **Fail-soft on corruption hides parse failures from consumers who'd want to know.** A walker that stops at byte 800 returns the same result shape as one that walked the whole IRB cleanly. Acceptable trade-off — a future caller who needs strict parsing can detect this by counting expected vs received records, but the common case (display whatever metadata is there) wins.
-- ❌ **Extended-size records terminate the walk early.** A pathological file with one extended record at the top would have all subsequent records dropped. v0.1 limitation; documented in module docstring as out of scope.
+- ❌ **Extended-size records terminate the walk early.** A file with an extended record at position 0 would yield empty `data`. Acceptable because (1) extended records are essentially absent from real-world IPTC, (2) any meaningful support would require porting bytes-summarization plumbing for the binary blobs they'd carry, and (3) silently advancing past one by guessing its length-of-length encoding would risk surfacing fabricated tag values — strictly worse than fail-stop.
 - ❌ **Datasets outside `IPTC_TAGS` are dropped silently with no diagnostic.** A user who expects an obscure tag to surface won't get a "we don't parse this" warning. Acceptable for v0.1 — adding the warning is one line if it ever becomes a real complaint.
 - 🔄 **Reconsider the never-raise invariant** if a downstream consumer (CLI, GUI) actually needs to distinguish "fully parsed" from "stopped at corruption". The walker could yield a sentinel or expose a "terminated_early" flag without changing the no-raise property.
 - 🔄 **Reconsider the tag table size** if real users complain about a missing common field. The 12-dataset list was sized for "what photo-editor UIs surface" and could grow if a use case demands it.
-- 🔄 **Reconsider extended-record support** if a real workflow surfaces a file whose interesting metadata lives past an extended record. Decoding the length-of-length is bounded work; it's just not worth the complexity for an unobserved case.
+- 🔄 **Reconsider extended-record support** if a real workflow surfaces a file whose interesting metadata lives past an extended record. The walker change is ~8 lines; the larger lift is wiring in bytes-summarization for the multi-MB blobs they'd carry. Cheap to do once there's a real use case to justify it.
 - 🔄 **Reconsider the two-pass charset** if profiling ever shows the materialization is a hot path. Single-pass with deferred decode (collect raw values, decode at the end) is a possible alternative, but unlikely to matter — IRBs are <4 KB in practice.
