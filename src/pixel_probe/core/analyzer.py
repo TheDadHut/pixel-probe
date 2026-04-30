@@ -3,17 +3,25 @@
 The :class:`Analyzer` runs a list of extractors against an image path and
 returns an :class:`AnalysisResult` keyed by extractor name. See ADR 0004
 (constructor DI vs plugin entry points) and ADR 0005 (sequential vs
-threaded execution) for the design rationale.
+threaded execution) for the design rationale; ADR 0011 documents the
+catch-distinction between expected and unexpected exceptions.
 
 Per-extractor exceptions are converted into error-only results so that one
-bad parser doesn't kill the whole run.
+bad parser doesn't kill the whole run. ``PixelProbeError`` subclasses are
+the expected failure shape (file-level catastrophic failures) and are
+caught silently. Any other ``Exception`` indicates a bug in the extractor;
+it's logged via :mod:`logging` so the traceback is visible to operators
+before being converted to error-in-result.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from pixel_probe.exceptions import PixelProbeError
 
 from .extractors.base import Extractor, ExtractorResult
 from .extractors.exif import ExifExtractor
@@ -25,6 +33,8 @@ __all__ = [
     "AnalysisResult",
     "Analyzer",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -75,19 +85,40 @@ class Analyzer:
     def analyze(self, path: Path) -> AnalysisResult:
         """Run every extractor against ``path``; return the aggregate.
 
-        Any :class:`Exception` raised by an individual extractor is caught
-        and wrapped in an error-only :class:`ExtractorResult` — one bad
-        parse doesn't stop the rest. Catastrophic infra failures
-        (e.g. ``KeyboardInterrupt``) propagate unchanged.
+        Two catch tiers per ADR 0011:
+
+        - :class:`~pixel_probe.exceptions.PixelProbeError` — expected
+          extractor-side failures (missing file, file-too-large,
+          decompression bomb). Caught silently and converted to
+          error-only :class:`ExtractorResult`.
+        - Any other :class:`Exception` — programming bug in the extractor.
+          Logged via :mod:`logging` (with traceback) before being
+          converted to error-in-result. The "BUG: " prefix on the error
+          string makes the distinction visible to consumers.
+
+        Catastrophic infra failures (e.g. :class:`KeyboardInterrupt`,
+        :class:`SystemExit`) aren't ``Exception`` subclasses and propagate
+        unchanged.
         """
         results: dict[str, ExtractorResult[Any]] = {}
         for extractor in self._extractors:
             try:
                 results[extractor.name] = extractor.extract(path)
-            except Exception as e:  # noqa: BLE001 - orchestrator is the catch-all boundary
+            except PixelProbeError as e:
                 results[extractor.name] = ExtractorResult(
                     extractor.name,
                     data=None,
                     errors=(f"{type(e).__name__}: {e}",),
+                )
+            except Exception as e:
+                logger.exception(
+                    "Unexpected exception in extractor %r processing %r — likely a bug",
+                    extractor.name,
+                    path,
+                )
+                results[extractor.name] = ExtractorResult(
+                    extractor.name,
+                    data=None,
+                    errors=(f"BUG: {type(e).__name__}: {e}",),
                 )
         return AnalysisResult(str(path), results)

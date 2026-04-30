@@ -287,10 +287,11 @@ class IptcExtractor(Extractor[IptcData]):
         data: IptcData = {}
 
         if not raw.startswith(_SOI):
+            # Zero-data failure: IPTC produces nothing for non-JPEG inputs.
+            # data=None + error per ADR 0011's normalization.
             return ExtractorResult(
                 self.name,
-                data,
-                warnings=("File is not a JPEG; IPTC v0.1 supports JPEG only",),
+                errors=("File is not a JPEG; IPTC v0.1 supports JPEG only",),
             )
 
         irb_payload = self._find_irb_payload(raw)

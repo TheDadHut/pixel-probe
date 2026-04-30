@@ -105,7 +105,8 @@ def test_handles_corrupt_block(monkeypatch: pytest.MonkeyPatch) -> None:
 
     result = ExifExtractor().extract(fixture_path("exif_rich.jpg"))
 
-    assert result.data == {}
+    # Per ADR 0011, zero-data failure → data=None.
+    assert result.data is None
     assert len(result.errors) == 1
     assert "ValueError" in result.errors[0]
     assert "fake corruption" in result.errors[0]
@@ -169,14 +170,16 @@ def test_missing_file_raises_typed_error(tmp_path: Path) -> None:
         ExifExtractor().extract(tmp_path / "does-not-exist.jpg")
 
 
-def test_unrecognised_format_warns_does_not_crash() -> None:
-    """A non-image file returns a warning, not an error — the file is real,
-    just not parseable as EXIF. Matches FileInfoExtractor's contract."""
+def test_unrecognised_format_returns_error_not_crash() -> None:
+    """A non-image file returns an error per ADR 0011 — extractor produced
+    zero data, so failure semantics apply (data=None, error not warning).
+    Diverges from FileInfoExtractor's contract because file_info ships
+    partial data (file-level fields) for non-images, while EXIF doesn't."""
     result = ExifExtractor().extract(fixture_path("not_an_image.txt"))
 
-    assert result.data == {}
-    assert result.errors == ()
-    assert result.warnings == ("File is not a recognized image format",)
+    assert result.data is None
+    assert result.warnings == ()
+    assert result.errors == ("File is not a recognized image format",)
 
 
 def test_idempotent() -> None:

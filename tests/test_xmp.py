@@ -120,10 +120,11 @@ def test_returns_empty_for_image_without_xmp() -> None:
 def test_malformed_xml_returns_error_not_crash() -> None:
     """A truncated XMP packet must surface a single error string and not
     propagate the :class:`xml.etree.ElementTree.ParseError` out — the
-    boundary contract for partial-failure parses."""
+    boundary contract for failure parses. Per ADR 0011, zero-data
+    failure → ``data=None``."""
     result = XmpExtractor().extract(fixture_path("xmp_malformed.jpg"))
 
-    assert result.data == {}
+    assert result.data is None
     assert len(result.errors) == 1
     assert "ParseError" in result.errors[0] or "parse error" in result.errors[0].lower()
 
@@ -138,14 +139,17 @@ def test_png_path_parses_xmp() -> None:
     assert result.data["dc"]["title"] == "PNG XMP Title"
 
 
-def test_unsupported_format_warns_returns_empty() -> None:
-    """A non-JPEG / non-PNG file (plain text fixture) returns empty +
-    one warning. TIFF support and other host formats are out of scope
-    for v0.1; the warning makes that visible to the caller."""
+def test_unsupported_format_returns_error() -> None:
+    """A non-JPEG / non-PNG file (plain text fixture) returns ``data=None``
+    + one error per ADR 0011. XMP produces zero data for unsupported host
+    formats — that's a failure, not a warning. TIFF support and other
+    host formats are out of scope for v0.1; the error makes that visible
+    to the caller."""
     result = XmpExtractor().extract(fixture_path("not_an_image.txt"))
 
-    assert result.data == {}
-    assert result.warnings == ("File is not a JPEG or PNG; XMP v0.1 supports JPEG/PNG only",)
+    assert result.data is None
+    assert result.warnings == ()
+    assert result.errors == ("File is not a JPEG or PNG; XMP v0.1 supports JPEG/PNG only",)
 
 
 def test_missing_file_raises_typed_error(tmp_path: Path) -> None:
@@ -218,8 +222,9 @@ def test_xxe_payload_blocked(tmp_path: Path) -> None:
 
     result = XmpExtractor().extract(out)
 
-    # Security gate: defusedxml rejected the parse. data is empty.
-    assert result.data == {}
+    # Security gate: defusedxml rejected the parse. Per ADR 0011,
+    # zero-data failure → data=None.
+    assert result.data is None
     assert len(result.errors) == 1
     assert "security" in result.errors[0].lower()
 
@@ -302,7 +307,8 @@ def test_compressed_png_itxt_malformed_surfaces_error(tmp_path: Path) -> None:
 
     result = XmpExtractor().extract(out)
 
-    assert result.data == {}
+    # Per ADR 0011, zero-data failure → data=None.
+    assert result.data is None
     assert result.warnings == ()
     assert any("Malformed compressed" in e for e in result.errors)
 
@@ -322,7 +328,8 @@ def test_compressed_png_itxt_bomb_surfaces_error(tmp_path: Path) -> None:
 
     result = XmpExtractor().extract(out)
 
-    assert result.data == {}
+    # Per ADR 0011, zero-data failure → data=None.
+    assert result.data is None
     assert result.warnings == ()
     assert any("decompression bomb" in e.lower() for e in result.errors)
 

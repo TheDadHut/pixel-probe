@@ -93,15 +93,31 @@ def test_exception_in_one_extractor_does_not_kill_others() -> None:
     assert result.results["last"].has_data
 
 
-def test_exception_message_includes_type_name() -> None:
-    """Error messages preserve the exception class — that's part of the
-    debuggability contract for whoever reads the result downstream."""
+def test_unexpected_exception_message_includes_bug_prefix() -> None:
+    """Per ADR 0011, exceptions that aren't ``PixelProbeError`` subclasses
+    indicate a programming bug. The orchestrator catches them, logs the
+    traceback, and surfaces as an error with a ``"BUG: "`` prefix so
+    consumers can tell the difference between expected extractor failures
+    and actual bugs."""
     analyzer = Analyzer([_RaisingExtractor("boom", FileNotFoundError("missing.jpg"))])
     result = analyzer.analyze(fixture_path("tiny.jpg"))
 
     msg = result.results["boom"].errors[0]
-    assert msg.startswith("FileNotFoundError:")
+    assert msg.startswith("BUG: FileNotFoundError:")
     assert "missing.jpg" in msg
+
+
+def test_pixel_probe_error_message_lacks_bug_prefix() -> None:
+    """Expected extractor failures (PixelProbeError subclasses) don't get
+    the BUG: prefix — they're known failure modes, not surprises."""
+    from pixel_probe.exceptions import MissingFileError
+
+    analyzer = Analyzer([_RaisingExtractor("boom", MissingFileError("not there"))])
+    result = analyzer.analyze(fixture_path("tiny.jpg"))
+
+    msg = result.results["boom"].errors[0]
+    assert msg.startswith("MissingFileError:")
+    assert "BUG" not in msg
 
 
 def test_keyboard_interrupt_propagates() -> None:

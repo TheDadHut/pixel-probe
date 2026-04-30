@@ -81,24 +81,26 @@ def test_handles_corrupt_block() -> None:
     assert result.warnings == ()
 
 
-def test_non_jpeg_warns_returns_empty() -> None:
-    """PNG → IPTC v0.1 returns empty + one warning. IPTC IIM in PNG is
-    rare in the wild and out of scope for v1 (the warning calls this out
-    so users aren't left wondering why nothing was parsed)."""
+def test_non_jpeg_returns_error() -> None:
+    """PNG → IPTC v0.1 returns ``data=None`` + one error per ADR 0011.
+    IPTC produces zero data on non-JPEG input — that's a failure, not a
+    warning. The error string makes the unsupported-format reason
+    visible to consumers."""
     result = IptcExtractor().extract(fixture_path("tiny.png"))
 
-    assert result.data == {}
-    assert result.errors == ()
-    assert result.warnings == ("File is not a JPEG; IPTC v0.1 supports JPEG only",)
+    assert result.data is None
+    assert result.warnings == ()
+    assert result.errors == ("File is not a JPEG; IPTC v0.1 supports JPEG only",)
 
 
-def test_text_file_warns_returns_empty() -> None:
+def test_text_file_returns_error() -> None:
     """Same contract for non-image files — caller chose to point us at a
-    non-JPEG, we return empty + a single warning, no crash."""
+    non-JPEG, IPTC produces zero data, so per ADR 0011: ``data=None`` +
+    error (not warning)."""
     result = IptcExtractor().extract(fixture_path("not_an_image.txt"))
 
-    assert result.data == {}
-    assert result.warnings == ("File is not a JPEG; IPTC v0.1 supports JPEG only",)
+    assert result.data is None
+    assert result.errors == ("File is not a JPEG; IPTC v0.1 supports JPEG only",)
 
 
 def test_missing_file_raises_typed_error(tmp_path: Path) -> None:

@@ -520,32 +520,42 @@ class XmpExtractor(Extractor[XmpData]):
         data: XmpData = {}
 
         if not raw.startswith((_JPEG_SOI, _PNG_SIGNATURE)):
+            # Zero-data failure: XMP produces nothing for non-JPEG/PNG inputs.
+            # data=None + error per ADR 0011's normalization.
             return ExtractorResult(
                 self.name,
-                data,
-                warnings=("File is not a JPEG or PNG; XMP v0.1 supports JPEG/PNG only",),
+                errors=("File is not a JPEG or PNG; XMP v0.1 supports JPEG/PNG only",),
             )
 
         packet, locator_warnings, locator_errors = _find_xmp_packet(raw)
         if packet is None:
-            # Surface any host-format walker diagnostics (e.g. malformed
-            # compressed iTXt, decompression-bomb detection) so the user
-            # sees why nothing was parsed.
+            # Two sub-cases:
+            #   1. locator_errors empty → no XMP packet found in a valid file.
+            #      Success-but-empty: data={}, no errors. Same shape as a JPEG
+            #      with no XMP block.
+            #   2. locator_errors non-empty → walker found an XMP-shaped chunk
+            #      but couldn't decode it (compressed-iTXt malformed, bomb,
+            #      etc.). Zero-data failure: data=None per ADR 0011.
+            if locator_errors:
+                return ExtractorResult(
+                    self.name,
+                    warnings=tuple(locator_warnings),
+                    errors=tuple(locator_errors),
+                )
             return ExtractorResult(
                 self.name,
                 data,
                 warnings=tuple(locator_warnings),
-                errors=tuple(locator_errors),
             )
 
         try:
             root = _safe_fromstring(packet)
         except DefusedXmlException as e:
             # XXE / DTD / external-entity attempt blocked by defusedxml.
-            # Surface as an error so the security gate is visible to callers.
+            # Zero-data failure (the security gate rejected the packet);
+            # data=None + error per ADR 0011's normalization.
             return ExtractorResult(
                 self.name,
-                data,
                 warnings=tuple(locator_warnings),
                 errors=(
                     *locator_errors,
@@ -553,9 +563,9 @@ class XmpExtractor(Extractor[XmpData]):
                 ),
             )
         except ParseError as e:
+            # Zero-data failure: malformed XML; data=None per ADR 0011.
             return ExtractorResult(
                 self.name,
-                data,
                 warnings=tuple(locator_warnings),
                 errors=(
                     *locator_errors,
