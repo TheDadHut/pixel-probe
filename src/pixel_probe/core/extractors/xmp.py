@@ -65,9 +65,13 @@ from .file_info import MAX_FILE_SIZE_BYTES
 
 __all__ = ["XmpData", "XmpExtractor"]
 
-#: Type alias for the XMP payload. Two-level dict: ``{prefix: {field: value}}``.
-#: Values are ``str`` or ``list[str]`` after RDF flattening.
-XmpData = dict[str, Any]
+#: Type alias for the XMP payload. Top-level keys are friendly namespace
+#: prefixes (``dc``, ``xmp``, ``photoshop`` …); their values are field maps.
+#: Inner-dict values are ``str``, ``list[str]``, or ``dict[str, Any]`` —
+#: the last for structured properties (``exif:Flash``, etc.) that flatten
+#: to a sub-record. The ``Any`` at the inner level absorbs that union
+#: honestly. Matches ADR 0003's prediction exactly.
+XmpData = dict[str, dict[str, Any]]
 
 # JPEG / PNG host-format constants
 _JPEG_SOI: Final = b"\xff\xd8"
@@ -108,17 +112,20 @@ _NAMESPACE_PREFIXES: Final[dict[str, str]] = {
 }
 
 
-def _find_xmp_packet(raw: bytes) -> bytes | None:
+def _find_xmp_packet(raw: bytes) -> tuple[bytes | None, list[str]]:
     """Locate the XMP packet bytes in a JPEG or PNG byte stream.
 
-    Dispatches on file signature. Returns ``None`` when the host format is
-    unsupported or no XMP packet is present.
+    Dispatches on file signature. Returns ``(packet_or_None, warnings)`` —
+    warnings carry diagnostics from the host-format walker (e.g. "compressed
+    iTXt detected" on the PNG path) so the extractor can surface them on
+    the result envelope. ``packet`` is ``None`` when the host format is
+    unsupported or no usable XMP packet is present.
     """
     if raw.startswith(_JPEG_SOI):
-        return _find_xmp_packet_jpeg(raw)
+        return _find_xmp_packet_jpeg(raw), []
     if raw.startswith(_PNG_SIGNATURE):
         return _find_xmp_packet_png(raw)
-    return None
+    return None, []
 
 
 def _find_xmp_packet_jpeg(raw: bytes) -> bytes | None:
@@ -154,18 +161,20 @@ def _find_xmp_packet_jpeg(raw: bytes) -> bytes | None:
     return None
 
 
-def _find_xmp_packet_png(raw: bytes) -> bytes | None:
+def _find_xmp_packet_png(raw: bytes) -> tuple[bytes | None, list[str]]:
     """Walk PNG chunks looking for an iTXt chunk with the XMP keyword.
 
     PNG chunk layout: ``<4-byte BE length> <4-byte type> <data> <4-byte CRC>``.
     The length field describes ``data`` only — the type field and CRC are
     fixed-size. We bounds-check before each chunk read.
 
-    Compressed iTXt is detected (compression flag = 1) and skipped with no
-    result — not bothering to decompress for this rare case.
+    Returns ``(packet_or_None, warnings)``. A compressed iTXt with the XMP
+    keyword surfaces a warning so the user sees why nothing was parsed
+    instead of silently looking like "no XMP".
     """
     offset = len(_PNG_SIGNATURE)
     n = len(raw)
+    warnings: list[str] = []
     # Minimum chunk shape: 4 length + 4 type + 4 CRC = 12 bytes.
     while offset + 12 <= n:
         length = int.from_bytes(raw[offset : offset + 4], "big")
@@ -174,41 +183,50 @@ def _find_xmp_packet_png(raw: bytes) -> bytes | None:
         data_end = data_start + length
         # data_end + 4 because the CRC follows the data.
         if data_end + 4 > n:
-            return None
+            return None, warnings
         if chunk_type == _PNG_ITXT_TYPE:
-            packet = _read_itxt_xmp(raw[data_start:data_end])
+            packet, chunk_warnings = _read_itxt_xmp(raw[data_start:data_end])
+            warnings.extend(chunk_warnings)
             if packet is not None:
-                return packet
+                return packet, warnings
         offset = data_end + 4  # next chunk: skip CRC
-    return None
+    return None, warnings
 
 
-def _read_itxt_xmp(data: bytes) -> bytes | None:
+def _read_itxt_xmp(data: bytes) -> tuple[bytes | None, list[str]]:
     """Parse an iTXt chunk payload; return its text only when keyword is XMP.
 
     iTXt structure: ``keyword \\0 compression-flag(1) compression-method(1)
     language-tag \\0 translated-keyword \\0 text``. We bounds-check each
     NUL-terminated section and bail on truncation.
+
+    Returns ``(packet_or_None, warnings)``. The compressed-flag-set case
+    surfaces a warning so consumers see why nothing was parsed; PNG spec
+    only defines flags 0 (uncompressed) and 1 (zlib), but we treat any
+    non-zero value as "skip + warn" for robustness against malformed
+    chunks.
     """
     nul = data.find(b"\x00")
     if nul == -1 or data[:nul] != _PNG_XMP_KEYWORD:
-        return None
+        return None, []
     # Need at least: nul + compression-flag + compression-method = nul + 3
     if len(data) < nul + 3:
-        return None
+        return None, []
     compression_flag = data[nul + 1]
-    if compression_flag == 1:
-        # Compressed XMP — skip rather than carry a zlib dep for this rare case.
-        return None
+    if compression_flag != 0:
+        # Compressed (or malformed-flag) iTXt — skip rather than carry a
+        # zlib dep for this rare case. Surface a warning so the user sees
+        # why nothing was parsed.
+        return None, ["Compressed XMP iTXt chunk detected; v0.1 supports uncompressed only"]
     # Skip language tag (\0-terminated) and translated keyword (\0-terminated).
     lang_start = nul + 3
     lang_end = data.find(b"\x00", lang_start)
     if lang_end == -1:
-        return None
+        return None, []
     tkw_end = data.find(b"\x00", lang_end + 1)
     if tkw_end == -1:
-        return None
-    return data[tkw_end + 1 :]
+        return None, []
+    return data[tkw_end + 1 :], []
 
 
 def _strip_namespace(qname: str) -> tuple[str | None, str]:
@@ -223,14 +241,25 @@ def _strip_namespace(qname: str) -> tuple[str | None, str]:
     return None, qname
 
 
-def _flatten_value(elem: Element) -> str | list[str]:
+def _flatten_value(elem: Element) -> str | list[str] | dict[str, Any]:
     """Convert an XMP property element to a Python primitive.
 
     - ``<rdf:Bag>`` / ``<rdf:Seq>`` → ``list[str]`` (in document order)
     - ``<rdf:Alt>`` → the ``x-default`` lang's text, or first ``rdf:li``
       if no ``x-default`` is present
+    - **Nested ``<rdf:Description>``** → flattened to a ``dict[str, Any]``
+      of its attribute-and-element fields (e.g., ``exif:Flash`` →
+      ``{"Fired": "True", "Mode": "0", ...}``). Sub-fields from namespaces
+      outside :data:`_NAMESPACE_PREFIXES` are dropped, same policy as the
+      top-level walker.
     - anything else → the element's stripped text content (empty string
       when absent)
+
+    A nested ``rdf:Description`` *inside* a Bag/Seq/Alt container (a
+    structured value within a list/alt) is not unwrapped — the list-style
+    flattening returns ``li.text`` only, so structured items become empty
+    strings. Real-world XMP rarely uses this combination; documenting as
+    a v0.1 limitation rather than recursing further.
     """
     children = list(elem)
     if len(children) == 1:
@@ -239,6 +268,8 @@ def _flatten_value(elem: Element) -> str | list[str]:
             return [(li.text or "") for li in container.findall(_RDF_LI)]
         if container.tag == _RDF_ALT:
             return _pick_alt_lang(container)
+        if container.tag == _RDF_DESCRIPTION:
+            return _flatten_description(container)
     return (elem.text or "").strip()
 
 
@@ -254,6 +285,33 @@ def _pick_alt_lang(container: Element) -> str:
     if items:
         return items[0].text or ""
     return ""
+
+
+def _flatten_description(desc: Element) -> dict[str, Any]:
+    """Flatten a structured ``<rdf:Description>`` into a dict of its
+    fields. Used for XMP properties whose value is a structured record —
+    e.g. ``exif:Flash`` carrying ``Fired`` / ``Mode`` / ``Function`` —
+    rather than a scalar / Bag / Seq / Alt.
+
+    Sub-fields from namespaces outside :data:`_NAMESPACE_PREFIXES` are
+    dropped (same policy as the top-level walker; ``rdf:about`` and other
+    RDF bookkeeping are filtered out by the namespace check since the RDF
+    namespace isn't in the friendly map). Sub-fields are keyed by their
+    local name only — the parent property's namespace already qualifies
+    the structured value, so re-prefixing the inner fields would be noisy.
+    """
+    result: dict[str, Any] = {}
+    for attr_qname, attr_value in desc.attrib.items():
+        uri, local = _strip_namespace(attr_qname)
+        if uri is None or uri not in _NAMESPACE_PREFIXES:
+            continue
+        result[local] = attr_value
+    for prop in desc:
+        uri, local = _strip_namespace(prop.tag)
+        if uri is None or uri not in _NAMESPACE_PREFIXES:
+            continue
+        result[local] = _flatten_value(prop)
+    return result
 
 
 def _flatten_xmp(root: Element) -> XmpData:
@@ -284,8 +342,29 @@ def _flatten_xmp(root: Element) -> XmpData:
             prefix = _NAMESPACE_PREFIXES.get(uri) if uri else None
             if prefix is None:
                 continue
+            # Note: when multiple <rdf:Description> blocks define the same
+            # (prefix, local) pair, the later one wins. Documented as policy
+            # in the function docstring above; in practice Description blocks
+            # split by namespace rather than duplicating fields, so this
+            # rarely fires.
             data.setdefault(prefix, {})[local] = _flatten_value(prop)
     return data
+
+
+def _has_extended_xmp(root: Element) -> bool:
+    """Return True when the tree contains an ``xmpNote:HasExtendedXMP``
+    attribute or element. The marker can appear either form; both are
+    legal per the XMP spec.
+    """
+    rdf = root if root.tag == _RDF_RDF else root.find(_RDF_RDF)
+    if rdf is None:
+        return False
+    for desc in rdf.findall(_RDF_DESCRIPTION):
+        if _HAS_EXTENDED_XMP in desc.attrib:
+            return True
+        if desc.find(_HAS_EXTENDED_XMP) is not None:
+            return True
+    return False
 
 
 class XmpExtractor(Extractor[XmpData]):
@@ -308,11 +387,15 @@ class XmpExtractor(Extractor[XmpData]):
     def extract(self, path: Path) -> ExtractorResult[XmpData]:
         if not path.is_file():
             raise MissingFileError(f"Not a file: {path}")
-        if path.stat().st_size > MAX_FILE_SIZE_BYTES:
-            raise FileTooLargeError(
-                f"{path} is {path.stat().st_size:,} bytes; max is {MAX_FILE_SIZE_BYTES:,}"
-            )
+        size = path.stat().st_size
+        if size > MAX_FILE_SIZE_BYTES:
+            raise FileTooLargeError(f"{path} is {size:,} bytes; max is {MAX_FILE_SIZE_BYTES:,}")
 
+        # XMP packets live in the first ~16 KB after a JPEG SOI or after the
+        # IHDR chunk in a PNG. The whole-file load is wasteful for that
+        # purpose but bounded by MAX_FILE_SIZE_BYTES (500 MB). Streaming a
+        # window would be more memory-efficient but adds complexity v0.1
+        # doesn't need — revisit if profiling shows pressure.
         raw = path.read_bytes()
         data: XmpData = {}
 
@@ -323,9 +406,11 @@ class XmpExtractor(Extractor[XmpData]):
                 warnings=("File is not a JPEG or PNG; XMP v0.1 supports JPEG/PNG only",),
             )
 
-        packet = _find_xmp_packet(raw)
+        packet, locator_warnings = _find_xmp_packet(raw)
         if packet is None:
-            return ExtractorResult(self.name, data)
+            # Surface any host-format walker diagnostics (e.g. compressed-iTXt
+            # detection) so the user sees why nothing was parsed.
+            return ExtractorResult(self.name, data, warnings=tuple(locator_warnings))
 
         try:
             root = _safe_fromstring(packet)
@@ -335,38 +420,24 @@ class XmpExtractor(Extractor[XmpData]):
             return ExtractorResult(
                 self.name,
                 data,
+                warnings=tuple(locator_warnings),
                 errors=(f"XMP rejected for security: {type(e).__name__}: {e}",),
             )
         except ParseError as e:
             return ExtractorResult(
                 self.name,
                 data,
+                warnings=tuple(locator_warnings),
                 errors=(f"XMP parse error: {type(e).__name__}: {e}",),
             )
 
-        warnings: tuple[str, ...] = ()
+        warnings: list[str] = list(locator_warnings)
         # Extended XMP — an additional packet referenced by xmpNote:HasExtendedXMP
         # is out of scope for v1. Surface a warning when the marker is present
         # so users know the main packet is what they're seeing.
         if _has_extended_xmp(root):
-            warnings = (
-                "Extended XMP detected (xmpNote:HasExtendedXMP); only the main packet is parsed",
+            warnings.append(
+                "Extended XMP detected (xmpNote:HasExtendedXMP); only the main packet is parsed"
             )
 
-        return ExtractorResult(self.name, _flatten_xmp(root), warnings=warnings)
-
-
-def _has_extended_xmp(root: Element) -> bool:
-    """Return True when the tree contains an ``xmpNote:HasExtendedXMP``
-    attribute or element. The marker can appear either form; both are
-    legal per the XMP spec.
-    """
-    rdf = root if root.tag == _RDF_RDF else root.find(_RDF_RDF)
-    if rdf is None:
-        return False
-    for desc in rdf.findall(_RDF_DESCRIPTION):
-        if _HAS_EXTENDED_XMP in desc.attrib:
-            return True
-        if desc.find(_HAS_EXTENDED_XMP) is not None:
-            return True
-    return False
+        return ExtractorResult(self.name, _flatten_xmp(root), warnings=tuple(warnings))

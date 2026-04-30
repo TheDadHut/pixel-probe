@@ -27,6 +27,7 @@ from pixel_probe.core.extractors.xmp import (
     _find_xmp_packet,
     _find_xmp_packet_jpeg,
     _find_xmp_packet_png,
+    _flatten_description,
     _flatten_value,
     _flatten_xmp,
     _has_extended_xmp,
@@ -188,7 +189,7 @@ def test_xxe_payload_blocked(tmp_path: Path) -> None:
     xxe_packet = (
         b'<?xml version="1.0"?>'
         b"<!DOCTYPE foo ["
-        b'  <!ENTITY xxe SYSTEM "file://' + bytes(str(secret_target), "utf-8") + b'">'
+        b'  <!ENTITY xxe SYSTEM "file://' + str(secret_target).encode() + b'">'
         b"]>"
         b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
         b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
@@ -244,6 +245,26 @@ def test_extended_xmp_warns(tmp_path: Path) -> None:
     result = XmpExtractor().extract(out)
 
     assert any("Extended XMP" in w for w in result.warnings)
+
+
+def test_compressed_png_itxt_surfaces_warning(tmp_path: Path) -> None:
+    """End-to-end: a PNG with a compressed iTXt XMP chunk returns empty
+    data + a warning so the user sees why nothing was parsed. Replaces
+    what was previously a silent miss; without the warning, a compressed-
+    XMP PNG looked indistinguishable from a no-XMP PNG."""
+    # Build a minimal PNG that's just signature + a compressed-iTXt chunk
+    # (no IHDR — our walker doesn't validate chunk order, only chunk
+    # structure, so this is enough to drive the path).
+    compressed = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00<garbage compressed text>"
+    chunk = _build_png_chunk(b"iTXt", compressed)
+    out = tmp_path / "compressed.png"
+    out.write_bytes(_PNG_SIGNATURE + chunk)
+
+    result = XmpExtractor().extract(out)
+
+    assert result.data == {}
+    assert result.errors == ()
+    assert any("Compressed XMP" in w for w in result.warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -367,14 +388,121 @@ def test_flatten_value_two_children_treated_as_simple() -> None:
 
 
 def test_flatten_value_single_non_container_child_falls_through_to_text() -> None:
-    """A property with exactly one child that's *not* Bag/Seq/Alt falls
-    through both structured-value rules (line 240's ``if`` and the Bag/Seq
-    ``if`` above it) and lands on the text-content fallback. Covers the
-    branch from the Alt check straight to the simple-text return."""
+    """A property with exactly one child that's *not* Bag/Seq/Alt/Description
+    falls through every structured-value rule and lands on the text-content
+    fallback. Covers the branch from the Description check straight to the
+    simple-text return."""
     xml = "<x>parent text<nested>child text</nested></x>"
     elem = fromstring(xml)
     # The single child isn't an RDF container — flattens to parent's text.
     assert _flatten_value(elem) == "parent text"
+
+
+def test_flatten_value_nested_description_to_dict() -> None:
+    """A property whose child is an ``<rdf:Description>`` (an XMP structured
+    value, e.g. ``exif:Flash``) flattens to a ``dict`` of the inner
+    Description's fields. Without this, the structured payload was silently
+    dropped — the value became an empty string."""
+    xml = (
+        '<exif:Flash xmlns:exif="http://ns.adobe.com/exif/1.0/"'
+        '            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description exif:Fired="True" exif:Mode="0" exif:Function="False"/>'
+        "</exif:Flash>"
+    )
+    elem = fromstring(xml)
+    flat = _flatten_value(elem)
+    assert isinstance(flat, dict)
+    assert flat == {"Fired": "True", "Mode": "0", "Function": "False"}
+
+
+def test_flatten_description_drops_unknown_namespace_attributes() -> None:
+    """A structured Description with attributes from a namespace not in our
+    friendly map drops those fields silently — same policy as the top-level
+    walker. Reuses the disjointness with rdf bookkeeping (rdf:about etc.)
+    since RDF isn't in the friendly map either."""
+    xml = (
+        '<rdf:Description xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"'
+        '                 xmlns:exif="http://ns.adobe.com/exif/1.0/"'
+        '                 xmlns:vendor="http://example.com/vendor/1.0/"'
+        '                 rdf:about=""'
+        '                 exif:Fired="True"'
+        '                 vendor:Internal="dropped" />'
+    )
+    elem = fromstring(xml)
+    assert _flatten_description(elem) == {"Fired": "True"}
+
+
+def test_flatten_description_recurses_into_element_form() -> None:
+    """Element-form sub-fields inside a structured Description are
+    flattened the same way attribute-form ones are. Recurses into
+    ``_flatten_value`` for each child, so deeper structured values
+    (rare) flatten correctly."""
+    xml = (
+        '<rdf:Description xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"'
+        '                 xmlns:exif="http://ns.adobe.com/exif/1.0/">'
+        "<exif:Fired>True</exif:Fired>"
+        "<exif:Mode>0</exif:Mode>"
+        "</rdf:Description>"
+    )
+    elem = fromstring(xml)
+    assert _flatten_description(elem) == {"Fired": "True", "Mode": "0"}
+
+
+def test_flatten_description_drops_unknown_namespace_elements() -> None:
+    """Element-form sub-fields from a namespace not in our friendly map
+    are dropped — same policy as the attribute-form case but covering
+    the second loop (``for prop in desc``)."""
+    xml = (
+        '<rdf:Description xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"'
+        '                 xmlns:exif="http://ns.adobe.com/exif/1.0/"'
+        '                 xmlns:vendor="http://example.com/vendor/1.0/">'
+        "<exif:Fired>True</exif:Fired>"
+        "<vendor:Internal>dropped</vendor:Internal>"
+        "</rdf:Description>"
+    )
+    elem = fromstring(xml)
+    assert _flatten_description(elem) == {"Fired": "True"}
+
+
+def test_flatten_description_empty_returns_empty_dict() -> None:
+    """A bare ``<rdf:Description/>`` with no attributes or children
+    flattens to an empty dict — defensive for spec-legal but unusual
+    structured-property shapes."""
+    xml = '<rdf:Description xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" />'
+    elem = fromstring(xml)
+    assert _flatten_description(elem) == {}
+
+
+def test_flatten_description_in_real_xmp_packet(tmp_path: Path) -> None:
+    """End-to-end: a full XMP packet with a structured ``exif:Flash``
+    surfaces the structured value as a dict on the result envelope.
+    Validates the full path from JPEG segment walker → defusedxml parse →
+    ``_flatten_xmp`` → ``_flatten_value`` → ``_flatten_description``."""
+    rdf_body = (
+        '<rdf:Description rdf:about=""'
+        '  xmlns:exif="http://ns.adobe.com/exif/1.0/">'
+        "<exif:Flash>"
+        '<rdf:Description exif:Fired="True" exif:Mode="0"/>'
+        "</exif:Flash>"
+        "</rdf:Description>"
+    )
+    packet = (
+        b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        + rdf_body.encode()
+        + b"</rdf:RDF>"
+        b"</x:xmpmeta>"
+    )
+    full_payload = b"http://ns.adobe.com/xap/1.0/\x00" + packet
+    length = len(full_payload) + 2
+    app1 = b"\xff\xe1" + length.to_bytes(2, "big") + full_payload
+    out = tmp_path / "structured.jpg"
+    out.write_bytes(b"\xff\xd8" + app1 + b"\xff\xd9")
+
+    result = XmpExtractor().extract(out)
+
+    assert result.errors == ()
+    assert result.data["exif"]["Flash"] == {"Fired": "True", "Mode": "0"}
 
 
 # ---------------------------------------------------------------------------
@@ -447,9 +575,9 @@ def test_flatten_xmp_unknown_attribute_namespace_dropped() -> None:
 
 
 def test_find_xmp_packet_unknown_format_returns_none() -> None:
-    """Bytes that match neither JPEG SOI nor the PNG signature → None."""
-    assert _find_xmp_packet(b"GIF89a...some random bytes") is None
-    assert _find_xmp_packet(b"") is None
+    """Bytes that match neither JPEG SOI nor the PNG signature → ``(None, [])``."""
+    assert _find_xmp_packet(b"GIF89a...some random bytes") == (None, [])
+    assert _find_xmp_packet(b"") == (None, [])
 
 
 def test_find_xmp_packet_jpeg_no_xmp_returns_none() -> None:
@@ -574,7 +702,7 @@ def test_find_xmp_packet_png_chunk_data_overruns_buffer() -> None:
         + b"abcd"  # any chunk type
         + b"xxxx"  # 4 dummy bytes — enough to satisfy the outer 20-byte threshold
     )
-    assert _find_xmp_packet_png(overrun) is None
+    assert _find_xmp_packet_png(overrun) == (None, [])
 
 
 # ---------------------------------------------------------------------------
@@ -598,27 +726,40 @@ _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def test_find_xmp_packet_png_no_xmp_returns_none() -> None:
-    """A PNG with no XMP iTXt chunk → None."""
-    # Just the signature with no chunks (technically not a valid PNG, but
-    # the chunk walker doesn't care — it just returns None when no chunks
-    # remain).
-    assert _find_xmp_packet_png(_PNG_SIGNATURE) is None
+    """A PNG with no XMP iTXt chunk → ``(None, [])``."""
+    assert _find_xmp_packet_png(_PNG_SIGNATURE) == (None, [])
 
 
 def test_find_xmp_packet_png_handles_truncated_chunk() -> None:
-    """A chunk header declaring more data than remains → None, no crash."""
+    """A chunk header declaring more data than remains → ``(None, [])``, no crash."""
     truncated = _PNG_SIGNATURE + (9999).to_bytes(4, "big") + b"iTXt" + b"abc"
-    assert _find_xmp_packet_png(truncated) is None
+    assert _find_xmp_packet_png(truncated) == (None, [])
 
 
-def test_find_xmp_packet_png_skips_compressed_xmp() -> None:
+def test_find_xmp_packet_png_skips_compressed_xmp_with_warning() -> None:
     """An iTXt chunk with compression-flag=1 (compressed text) is skipped
-    rather than decompressed — keeping the dep graph zlib-free."""
+    rather than decompressed — keeping the dep graph zlib-free. The user
+    sees a warning so "no XMP found" doesn't look like a silent miss."""
     # iTXt: keyword \0 compression-flag(1) compression-method(0) lang \0 tkw \0 text
     compressed = b"XML:com.adobe.xmp\x00\x01\x00\x00\x00<garbage compressed text>"
     chunk = _build_png_chunk(b"iTXt", compressed)
     png = _PNG_SIGNATURE + chunk
-    assert _find_xmp_packet_png(png) is None
+    packet, warnings = _find_xmp_packet_png(png)
+    assert packet is None
+    assert any("Compressed XMP" in w for w in warnings)
+
+
+def test_find_xmp_packet_png_skips_unknown_compression_flag_with_warning() -> None:
+    """The PNG iTXt spec defines compression-flag values 0 (uncompressed)
+    and 1 (zlib). Any other value indicates a malformed chunk; we treat
+    it the same as compressed — skip + warn — rather than blindly reading
+    the rest as text. Defensive against malformed inputs."""
+    malformed = b"XML:com.adobe.xmp\x00\x07\x00\x00\x00<looks like XMP body>"
+    chunk = _build_png_chunk(b"iTXt", malformed)
+    png = _PNG_SIGNATURE + chunk
+    packet, warnings = _find_xmp_packet_png(png)
+    assert packet is None
+    assert any("Compressed XMP" in w for w in warnings)
 
 
 def test_find_xmp_packet_png_skips_non_xmp_itxt() -> None:
@@ -628,27 +769,27 @@ def test_find_xmp_packet_png_skips_non_xmp_itxt() -> None:
     payload = b"Author\x00\x00\x00\x00\x00Alice"
     chunk = _build_png_chunk(b"iTXt", payload)
     png = _PNG_SIGNATURE + chunk
-    assert _find_xmp_packet_png(png) is None
+    assert _find_xmp_packet_png(png) == (None, [])
 
 
 def test_read_itxt_xmp_handles_missing_keyword_terminator() -> None:
-    """An iTXt payload with no NUL terminator after the keyword → None."""
-    assert _read_itxt_xmp(b"XML:com.adobe.xmp_no_nul_here") is None
+    """An iTXt payload with no NUL terminator after the keyword → ``(None, [])``."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp_no_nul_here") == (None, [])
 
 
 def test_read_itxt_xmp_handles_truncated_after_keyword() -> None:
-    """An iTXt payload that ends before the compression flags fits → None."""
-    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00") is None
+    """An iTXt payload that ends before the compression flags fits → ``(None, [])``."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00") == (None, [])
 
 
 def test_read_itxt_xmp_handles_missing_lang_terminator() -> None:
-    """An iTXt payload missing the language-tag NUL terminator → None."""
-    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00\x00\x00xx-no-end") is None
+    """An iTXt payload missing the language-tag NUL terminator → ``(None, [])``."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00\x00\x00xx-no-end") == (None, [])
 
 
 def test_read_itxt_xmp_handles_missing_translated_keyword_terminator() -> None:
-    """An iTXt payload missing the translated-keyword NUL terminator → None."""
-    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00\x00\x00\x00no-end") is None
+    """An iTXt payload missing the translated-keyword NUL terminator → ``(None, [])``."""
+    assert _read_itxt_xmp(b"XML:com.adobe.xmp\x00\x00\x00\x00no-end") == (None, [])
 
 
 # ---------------------------------------------------------------------------
