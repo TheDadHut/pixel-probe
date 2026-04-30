@@ -30,12 +30,18 @@ Define a typed exception hierarchy in `pixel_probe.exceptions`:
 
 - `PixelProbeError(Exception)` — base. Library code never raises bare `Exception` / `ValueError`.
 - `MissingFileError` — input path doesn't exist or isn't a regular file.
-- `UnsupportedFormatError` — extractor doesn't support the given format.
-- `CorruptMetadataError` — metadata block exists but cannot be parsed.
 - `FileTooLargeError` — file exceeds the configured max size.
 - `DecompressionBombError` — image pixel count exceeds the configured maximum (wraps Pillow's exception via `__cause__`).
 
-Every catastrophic failure in any extractor must raise a subclass of `PixelProbeError`. The orchestrator's `except Exception` boundary catches them all and converts to error-only `ExtractorResult` so one bad parse doesn't kill the run; downstream code that wants to handle a specific failure can catch the typed subclass before that boundary.
+Every **catastrophic, file-level** failure in any extractor must raise a subclass of `PixelProbeError`. The orchestrator's `except Exception` boundary catches them all and converts to error-only `ExtractorResult` so one bad parse doesn't kill the run; downstream code that wants to handle a specific failure can catch the typed subclass before that boundary.
+
+**Partial-extraction failures** (malformed metadata block, format unsupported by a specific extractor, per-tag decode error) are *not* in the hierarchy — they're surfaced as `errors` / `warnings` on the result envelope per [ADR 0003](0003-hybrid-result-shape.md)'s error model. The architecture deliberately keeps these inline so partial diagnostics (e.g., XMP host-format walker warnings) ship alongside the failure rather than being lost when an exception unwinds. See ADR 0003 for the catastrophic-vs-partial distinction.
+
+### Why no `CorruptMetadataError` or `UnsupportedFormatError`
+
+The original draft of this ADR included `CorruptMetadataError` and `UnsupportedFormatError`. Both were defined in `pixel_probe.exceptions` but never raised by any extractor — because [ADR 0003](0003-hybrid-result-shape.md) routes those cases through error-in-result rather than exception propagation. The `except CorruptMetadataError` filtering promise that motivated their inclusion was architecturally unreachable: the orchestrator never sees them.
+
+We removed both classes rather than maintaining defined-but-unraisable types. Adding them back is one-line work if a future code path genuinely needs to raise them; the present architecture doesn't.
 
 ## Consequences
 
@@ -43,6 +49,7 @@ Every catastrophic failure in any extractor must raise a subclass of `PixelProbe
 - ✅ Specific handling stays available: code that legitimately cares about "file too large" vs "bomb" can catch the subclass directly.
 - ✅ mypy strict narrows correctly inside `except` blocks — handler code knows it has the specific subclass.
 - ✅ Self-documenting: the exception class name is the first line of failure-mode documentation a caller sees.
+- ✅ **Honest hierarchy.** Every class in the hierarchy is actually raised somewhere; defined-but-unused types removed.
 - ❌ Maintenance discipline: the contract is "every catastrophic path stays inside the hierarchy". This is real work — the initial Phase 1 implementation accidentally raised Python's builtin `FileNotFoundError`, breaking the `except PixelProbeError` filter. The fix was adding `MissingFileError` and updating the call site. The contract needs to be enforced by review, not by tooling.
-- ❌ Five (and growing) classes is more surface than a single error type would be. Worth it for the type-narrowing win.
-- 🔄 Reconsider only if a future failure mode genuinely doesn't fit any existing class and would create a fifth or sixth top-level distinction. Likely never — the five names cover most binary-format failure modes.
+- ❌ Per-extractor failure modes (corrupt block, unsupported format) aren't typed — callers grep error strings if they want to distinguish them. Acceptable given partial-extraction semantics; revisit if a real consumer needs to filter by failure category.
+- 🔄 Reconsider re-introducing typed partial-extraction errors (e.g. `CorruptMetadataError`) if a refactor of the ADR 0003 error model lets exceptions carry partial-extraction context cleanly (e.g., a `partial_data` field). At that point the architectural blocker is gone.

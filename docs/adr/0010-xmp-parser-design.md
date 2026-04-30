@@ -123,12 +123,13 @@ The XMP extractor has four decode-failure paths, all of which surface as **error
 
 All four mean "we found an XMP-shaped chunk but couldn't extract content from it" — same severity tier. Surfacing them uniformly as `errors` lets consumers grep one field for parse failures regardless of which layer (host-format walker vs XML parser) caught them.
 
-This deviates from a strict reading of [ADR 0006](0006-custom-exception-hierarchy.md), which describes `CorruptMetadataError` as the right class for "metadata block exists but cannot be parsed". The implementation chose error-in-result for consistency with the EXIF and IPTC patterns:
+The error-in-result approach matches the project-wide pattern established in [ADR 0006](0006-custom-exception-hierarchy.md): catastrophic file-level failures (`MissingFileError`, `FileTooLargeError`, `DecompressionBombError`) raise; partial-extraction issues (corrupt block, unsupported per-extractor format) surface inline on the result envelope so partial diagnostics — e.g. the host-format walker's accumulated warnings — ship alongside the failure rather than being lost when an exception unwinds.
 
 - **EXIF**: a corrupt EXIF block (`Image.getexif` raising) becomes an error string, not a raise.
 - **IPTC**: a corrupt IIM record terminates the walker; partial data ships in `data`.
+- **XMP**: the four cases above.
 
-Across the three extractors, "extant-but-corrupt block" never raises out of `extract`. Catastrophic failures that *do* raise are file-level: `MissingFileError`, `FileTooLargeError`, `DecompressionBombError`. The `CorruptMetadataError` class is defined but unused project-wide. A future cleanup could either start using it consistently or remove it.
+The original draft of this ADR flagged `CorruptMetadataError` (then defined but unused) as a separate cleanup question. ADR 0006 has since removed `CorruptMetadataError` and `UnsupportedFormatError` from the hierarchy on the grounds that they were architecturally unreachable — the orchestrator's catch-all never sees them, since extractors deliberately don't propagate "extant-but-corrupt" cases.
 
 ### XXE rejection as deliberate portfolio signal
 
@@ -152,7 +153,7 @@ If anyone ever swaps `defusedxml.ElementTree.fromstring` for the stdlib `xml.etr
 - ✅ **Friendly-prefix subset surface is reviewable in 6 lines.** Adding a namespace is one entry in the map.
 - ❌ **Extended XMP is unsupported.** Files with extended packets see only the main one. Acceptable since main-packet content covers the photo-editor-visible fields.
 - ❌ **Structured values inside Bag/Seq/Alt containers flatten to empty strings.** Documented as a v0.1 limitation; recursion into nested-Description-inside-li would double the flattening surface.
-- ❌ **Failed-decode paths don't raise `CorruptMetadataError`.** Inconsistent with a strict reading of ADR 0006; consistent with the EXIF + IPTC implementations. The class is defined but unused project-wide — separate cleanup either way.
+- ❌ **Failed-decode paths aren't typed exceptions** — callers grep error-string content to distinguish "XMP parse error" from "Malformed compressed XMP iTXt chunk". Acceptable given the partial-extraction semantic, but a future refactor could let exceptions carry partial context (see ADR 0006's "Reconsider" line).
 - 🔄 **Reconsider extended XMP** if a real consumer needs thumbnails-or-history from the second packet. The segment-walker can be extended to locate-and-merge.
 - 🔄 **Reconsider TIFF host-format support** when TIFF support overall is added. Tag 700 is the standard location.
 - 🔄 **Reconsider the friendly-prefix map** if a real workflow wants Lightroom-develop or another vendor namespace surfaced. Adding a prefix is one map entry; no logic change.

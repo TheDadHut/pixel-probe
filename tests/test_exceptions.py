@@ -5,12 +5,10 @@ from __future__ import annotations
 import pytest
 
 from pixel_probe.exceptions import (
-    CorruptMetadataError,
     DecompressionBombError,
     FileTooLargeError,
     MissingFileError,
     PixelProbeError,
-    UnsupportedFormatError,
 )
 
 
@@ -23,8 +21,6 @@ def test_all_subclasses_inherit_from_pixel_probe_error() -> None:
     catch the family with one ``except`` clause."""
     for cls in (
         MissingFileError,
-        UnsupportedFormatError,
-        CorruptMetadataError,
         FileTooLargeError,
         DecompressionBombError,
     ):
