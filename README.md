@@ -64,13 +64,16 @@ pip install -e ".[dev,docs]"
 pixel-probe path/to/image.jpg
 
 # JSON output (pipe-friendly)
-pixel-probe path/to/image.jpg --json
+pixel-probe path/to/image.jpg --json | jq .results.exif.data
 
-# Filter to a single category
-pixel-probe path/to/image.jpg --only exif
+# Filter to one or more extractors
+pixel-probe path/to/image.jpg --only exif,iptc
+
+# Verbose (DEBUG-level) logging to stderr
+pixel-probe path/to/image.jpg -v
 ```
 
-*(CLI lands in PR 4; the entry point is reserved now.)*
+Exit codes follow common Unix conventions: `0` on successful analysis (per-extractor errors and warnings still surface in the output), `1` on missing input file, `2` on argument errors.
 
 ### GUI
 
