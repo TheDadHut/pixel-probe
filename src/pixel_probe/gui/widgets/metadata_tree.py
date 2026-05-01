@@ -11,16 +11,22 @@ roles for warnings/errors, and a clean read-only contract that
 :class:`QSortFilterProxyModel` can wrap without surprises. ADR 0001
 calls this out as the load-bearing portfolio piece on the GUI side.
 
-**Tree shape** (one top-level node per extractor in declared order):
+**Tree shape** — one top-level node per extractor (declared order); each
+extractor section has its own children. One section shown in detail::
 
-- ``file_info`` ─┬─ size_bytes : 1234
-- ``exif``      ─┼─ Make       : TestCorp
-- ``iptc``      ─┼─ Keywords   ─┬─ [0]: alpha
-- ``xmp``       ─┘              └─ [1]: beta
-                  ├─ gps        ─┬─ latitude  : 37.5
-                  │              └─ longitude : -122.4
-                  ├─ warning    : (italic) ...
-                  └─ error      : (italic) ...
+    file_info → ...
+    exif
+        Make       : TestCorp
+        gps
+            latitude  : 37.5
+            longitude : -122.4
+        warning    : (italic) ...
+        error      : (italic) ...
+    iptc
+        Keywords
+            [0]: alpha
+            [1]: beta
+    xmp → ...
 
 Construction rules in :meth:`MetadataTreeModel._build_tree`:
 
@@ -45,13 +51,19 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any
 
-from PySide6.QtCore import QAbstractItemModel, QModelIndex, QPersistentModelIndex, Qt
+from PySide6.QtCore import (
+    QAbstractItemModel,
+    QModelIndex,
+    QObject,
+    QPersistentModelIndex,
+    Qt,
+)
 from PySide6.QtGui import QFont
 
 from pixel_probe.core.analyzer import AnalysisResult
 from pixel_probe.core.extractors.base import ExtractorResult
 
-__all__ = ["MetadataTreeModel", "Node"]
+__all__ = ["MetadataTreeModel"]
 
 #: Type alias for Qt's "index parameter" — Qt accepts either form everywhere
 #: the index API takes a parameter; PySide6's stubs reflect that. Override
@@ -69,19 +81,28 @@ _HEADERS: tuple[str, str] = ("Field", "Value")
 class Node:
     """A single row in the metadata tree.
 
+    Internal type — not part of the public API (omitted from ``__all__``);
+    callers interact only with :class:`MetadataTreeModel`. Kept under the
+    plain name ``Node`` so the source reads naturally without underscore
+    prefixes everywhere.
+
     Not frozen — :meth:`MetadataTreeModel._build_tree` mutates ``children``
     during construction. After ``set_result`` returns, the tree is
     effectively immutable until the next reset.
 
     The ``parent`` back-reference is load-bearing for ``QAbstractItemModel.parent``
     — Qt needs to walk from any index back to its parent index, and the
-    fastest way is a direct pointer.
+    fastest way is a direct pointer. ``row_in_parent`` is cached at build
+    time so :meth:`MetadataTreeModel.parent` is O(1) instead of scanning
+    the parent's child list (sections with hundreds of EXIF tags would
+    otherwise turn the tree walk O(N²)).
     """
 
     key: str
     value: str = ""
     children: list[Node] = field(default_factory=list)
     parent: Node | None = None
+    row_in_parent: int = 0
     italic: bool = False  # rendered with italic font role (warnings + errors)
 
 
@@ -93,9 +114,10 @@ class MetadataTreeModel(QAbstractItemModel):
     children are the extractor sections.
     """
 
-    def __init__(self, parent: QAbstractItemModel | None = None) -> None:
-        # The cast keeps mypy happy — QAbstractItemModel.__init__ wants a
-        # QObject parent, and QAbstractItemModel is a QObject subclass.
+    def __init__(self, parent: QObject | None = None) -> None:
+        # Qt parent is QObject (typically the view widget), not another model;
+        # narrowing the annotation here would block MainWindow's
+        # ``MetadataTreeModel(self)`` call from a QMainWindow.
         super().__init__(parent)
         self._root: Node = Node(key="")
 
@@ -120,9 +142,8 @@ class MetadataTreeModel(QAbstractItemModel):
         order (orchestrator's insertion order; see ADR 0005)."""
         root = Node(key="")
         for name, entry in result.results.items():
-            section = Node(key=name, parent=root)
-            root.children.append(section)
-            self._populate_section(entry, section)
+            self._append_child(root, Node(key=name))
+            self._populate_section(entry, root.children[-1])
         return root
 
     def _populate_section(self, entry: ExtractorResult[Any], section: Node) -> None:
@@ -131,22 +152,22 @@ class MetadataTreeModel(QAbstractItemModel):
         where the eye lands first)."""
         data = entry.data
         if data is None:
-            section.children.append(Node(key="(no data)", parent=section))
+            self._append_child(section, Node(key="(no data)"))
         elif is_dataclass(data) and not isinstance(data, type):
             self._add_dict_children(asdict(data), section)
         elif isinstance(data, dict):
             if data:
                 self._add_dict_children(data, section)
             else:
-                section.children.append(Node(key="(empty)", parent=section))
+                self._append_child(section, Node(key="(empty)"))
         else:
             # Defensive: unknown payload shape from a custom extractor.
-            section.children.append(Node(key=repr(data), parent=section))
+            self._append_child(section, Node(key=repr(data)))
 
         for warning in entry.warnings:
-            section.children.append(Node(key="warning", value=warning, parent=section, italic=True))
+            self._append_child(section, Node(key="warning", value=warning, italic=True))
         for err in entry.errors:
-            section.children.append(Node(key="error", value=err, parent=section, italic=True))
+            self._append_child(section, Node(key="error", value=err, italic=True))
 
     def _add_dict_children(self, mapping: dict[str, Any], parent_node: Node) -> None:
         """Recurse a dict into Node children. Dicts become subtrees,
@@ -154,18 +175,27 @@ class MetadataTreeModel(QAbstractItemModel):
         values become leaves."""
         for key, value in mapping.items():
             if isinstance(value, dict):
-                child = Node(key=str(key), parent=parent_node)
-                parent_node.children.append(child)
-                self._add_dict_children(value, child)
+                self._append_child(parent_node, Node(key=str(key)))
+                self._add_dict_children(value, parent_node.children[-1])
             elif isinstance(value, list):
-                child = Node(key=str(key), parent=parent_node)
-                parent_node.children.append(child)
+                self._append_child(parent_node, Node(key=str(key)))
+                list_node = parent_node.children[-1]
                 for index, item in enumerate(value):
-                    child.children.append(Node(key=f"[{index}]", value=str(item), parent=child))
+                    self._append_child(list_node, Node(key=f"[{index}]", value=str(item)))
             else:
-                parent_node.children.append(
-                    Node(key=str(key), value=str(value), parent=parent_node)
-                )
+                self._append_child(parent_node, Node(key=str(key), value=str(value)))
+
+    @staticmethod
+    def _append_child(parent_node: Node, child: Node) -> None:
+        """Attach ``child`` to ``parent_node`` and stamp the back-pointers.
+
+        Centralized so every Node we add gets ``parent`` and
+        ``row_in_parent`` set consistently — the latter is what makes
+        :meth:`parent` O(1) instead of scanning siblings on every call.
+        """
+        child.parent = parent_node
+        child.row_in_parent = len(parent_node.children)
+        parent_node.children.append(child)
 
     # -- QAbstractItemModel API -----------------------------------------------
 
@@ -195,9 +225,8 @@ class MetadataTreeModel(QAbstractItemModel):
     def parent(self, index: _Index = QModelIndex()) -> QModelIndex:  # type: ignore[override]
         """Return the parent index of ``index``, or invalid if at top level.
 
-        Qt's signature takes a :class:`QModelIndex`; we honour the override
-        even though the default param matches the base class's no-arg form
-        used during initial population.
+        Uses the ``row_in_parent`` cached on each :class:`Node` at build
+        time, so this is O(1) per call regardless of sibling count.
         """
         if not index.isValid():
             return QModelIndex()
@@ -205,17 +234,7 @@ class MetadataTreeModel(QAbstractItemModel):
         parent_node = node.parent
         if parent_node is None or parent_node is self._root:
             return QModelIndex()
-        # Find parent's row in *its* parent (the grandparent).
-        grandparent = parent_node.parent
-        if grandparent is None:  # pragma: no cover
-            # Defensive: every non-root node we construct has a parent
-            # back-reference set, so this branch is unreachable in normal
-            # flow. Guards against a future tree-builder bug that creates
-            # an orphan node — silently returning invalid is safer than
-            # a None-deref.
-            return QModelIndex()
-        row = grandparent.children.index(parent_node)
-        return self.createIndex(row, _COLUMN_FIELD, parent_node)
+        return self.createIndex(parent_node.row_in_parent, _COLUMN_FIELD, parent_node)
 
     def rowCount(self, parent: _Index = QModelIndex()) -> int:
         """Number of children of ``parent``. Per Qt convention only column 0
@@ -261,9 +280,8 @@ class MetadataTreeModel(QAbstractItemModel):
         return None
 
     def flags(self, index: _Index) -> Qt.ItemFlag:
-        """All cells are selectable + enabled but not editable. Selectable
-        is needed for the Phase 5b ``Ctrl+C`` copy-of-selected-value
-        affordance."""
+        """Selectable + enabled, not editable — read-only view of an
+        analysis result."""
         if not index.isValid():
             return Qt.ItemFlag.NoItemFlags
         return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
@@ -280,9 +298,12 @@ class MetadataTreeModel(QAbstractItemModel):
 
     @staticmethod
     def _node_from_index(index: _Index) -> Node:
-        """Type-narrowed alias for ``index.internalPointer()``. Qt's
-        ``internalPointer`` returns ``Any``; we know our pointers are
-        always :class:`Node` instances."""
+        """Type-narrowed alias for ``index.internalPointer()``.
+
+        Qt's ``internalPointer`` returns ``Any``; the assert is a mypy
+        type-narrowing aid, not a runtime guard. The invariant is
+        enforced by :meth:`index` — every :class:`QModelIndex` we
+        construct passes a :class:`Node` as the internal pointer."""
         node = index.internalPointer()
-        assert isinstance(node, Node)  # noqa: S101 — load-bearing invariant
+        assert isinstance(node, Node)  # noqa: S101 — type narrowing for mypy
         return node
