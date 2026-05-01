@@ -58,9 +58,10 @@ __all__ = ["MetadataTreeModel", "Node"]
 #: signatures must use the union to satisfy LSP per mypy strict.
 _Index = QModelIndex | QPersistentModelIndex
 
-#: Column indices. Two columns: the field name (key) and its display value.
+#: Column index for the field-name column. Column 1 (value) is implicit in
+#: the 2-column model and doesn't need a named constant — only column 0 is
+#: referenced by name (in ``createIndex`` parent-side calls).
 _COLUMN_FIELD = 0
-_COLUMN_VALUE = 1
 _HEADERS: tuple[str, str] = ("Field", "Value")
 
 
