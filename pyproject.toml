@@ -154,10 +154,6 @@ enable_error_code = [
 [tool.coverage.run]
 source = ["src/pixel_probe"]
 branch = true
-omit = [
-    # CLI stub — real implementation + tests ship in PR 4. Remove this entry then.
-    "src/pixel_probe/cli.py",
-]
 
 [tool.coverage.report]
 exclude_lines = [
