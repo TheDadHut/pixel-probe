@@ -8,8 +8,8 @@ The model is a custom :class:`QAbstractItemModel` rather than the
 convenience :class:`QStandardItemModel`. The trade-off: ~120 extra lines
 of plumbing in exchange for direct control over the tree shape, font
 roles for warnings/errors, and a clean read-only contract that
-:class:`QSortFilterProxyModel` can wrap without surprises. ADR 0001
-calls this out as the load-bearing portfolio piece on the GUI side.
+:class:`QSortFilterProxyModel` can wrap without surprises. See ADR 0013
+for the full reasoning.
 
 **Tree shape** — one top-level node per extractor (declared order); each
 extractor section has its own children. One section shown in detail::

@@ -3,8 +3,8 @@ result signals.
 
 Uses the **QObject + moveToThread** pattern rather than subclassing
 ``QThread`` — recommended by the Qt documentation since 4.8 (the
-subclass-QThread pattern is a common source of lifecycle bugs). ADR
-0001's "considered alternatives" section documents the choice.
+subclass-QThread pattern is a common source of lifecycle bugs). See
+ADR 0013 for the full reasoning.
 
 The wiring lives in Phase 5b's ``MainWindow._start_analysis``:
 
