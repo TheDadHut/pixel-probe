@@ -126,9 +126,14 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py"          = ["S101"]   # asserts are required in tests
-"src/pixel_probe/cli.py" = ["T201"]   # CLI legitimately prints
-"scripts/**/*.py"        = ["T201"]   # build scripts legitimately print
+"tests/**/*.py"               = ["S101"]   # asserts are required in tests
+"src/pixel_probe/cli.py"      = ["T201"]   # CLI legitimately prints
+"scripts/**/*.py"             = ["T201"]   # build scripts legitimately print
+# Qt overrides use camelCase by API convention — N802 fights every override.
+# B008 fires on the Qt-idiomatic `parent: QModelIndex = QModelIndex()` pattern,
+# which is the documented Qt signature for QAbstractItemModel methods.
+"src/pixel_probe/gui/**/*.py" = ["N802", "B008"]
+"tests/gui/**/*.py"           = ["B008"]   # Qt default-arg pattern in test helpers
 
 [tool.ruff.lint.isort]
 known-first-party = ["pixel_probe"]
