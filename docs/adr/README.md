@@ -18,6 +18,7 @@ Format: [MADR](https://adr.github.io/madr/) (Status / Context / Decision / Conse
 - [0010 — XMP parser design](0010-xmp-parser-design.md)
 - [0011 — Failure-handling normalization across extractors](0011-failure-handling-normalization.md)
 - [0012 — Reduced exception hierarchy](0012-reduced-exception-hierarchy.md) *(revises [0006](0006-custom-exception-hierarchy.md))*
+- [0013 — GUI architecture](0013-gui-architecture.md)
 
 ## When to write a new ADR
 
