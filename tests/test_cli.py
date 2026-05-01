@@ -95,6 +95,19 @@ def test_cli_only_filter_includes_only_requested() -> None:
     assert "== xmp ==" not in proc.stdout
 
 
+def test_cli_only_filter_preserves_argv_order() -> None:
+    """``--only`` honours user-specified ordering, deviating from
+    ``Analyzer.default()``'s declared order. Documented in
+    ``_filter_result``'s docstring as a deliberate UX choice — when the
+    user explicitly orders extractors, that beats canonical ordering."""
+    proc = _run_cli(str(fixture_path("exif_rich.jpg")), "--only", "xmp,exif")
+
+    assert proc.returncode == 0
+    # xmp section appears before exif in stdout — opposite of the canonical
+    # declared order (file_info, exif, iptc, xmp) that Analyzer.default uses.
+    assert proc.stdout.index("== xmp ==") < proc.stdout.index("== exif ==")
+
+
 def test_cli_missing_file_exits_one(tmp_path: Path) -> None:
     """Missing input file → exit 1, single line on stderr, nothing on
     stdout. Standard Unix CLI behavior."""
@@ -102,7 +115,19 @@ def test_cli_missing_file_exits_one(tmp_path: Path) -> None:
 
     assert proc.returncode == 1
     assert proc.stdout == ""
-    assert "No such file" in proc.stderr
+    assert "no such file" in proc.stderr.lower()
+
+
+def test_cli_directory_argument_exits_one(tmp_path: Path) -> None:
+    """A path that exists but isn't a regular file (directory, FIFO,
+    socket) also exits 1 — but with a different error message that
+    distinguishes "doesn't exist" from "exists but wrong type" so the
+    user knows whether to check spelling or path target shape."""
+    proc = _run_cli(str(tmp_path))
+
+    assert proc.returncode == 1
+    assert proc.stdout == ""
+    assert "not a regular file" in proc.stderr.lower()
 
 
 def test_cli_invalid_only_exits_two() -> None:
@@ -164,7 +189,7 @@ def test_main_returns_one_on_missing_file(
     rc = main([str(tmp_path / "nope.jpg")])
     assert rc == 1
     captured = capsys.readouterr()
-    assert "No such file" in captured.err
+    assert "no such file" in captured.err.lower()
     assert captured.out == ""
 
 
@@ -188,6 +213,22 @@ def test_main_json_flag_emits_json(capsys: pytest.CaptureFixture[str]) -> None:
     assert "results" in parsed
 
 
+def test_main_accepts_custom_analyzer(capsys: pytest.CaptureFixture[str]) -> None:
+    """The ``analyzer=`` kwarg lets callers (typically tests, but also
+    advanced consumers) drive ``main`` with a custom extractor list.
+    Documented as the DI hook for non-default workflows."""
+    from pixel_probe.core.analyzer import Analyzer
+    from pixel_probe.core.extractors.file_info import FileInfoExtractor
+
+    analyzer = Analyzer([FileInfoExtractor()])  # only file_info, no exif/iptc/xmp
+    rc = main([str(fixture_path("exif_rich.jpg"))], analyzer=analyzer)
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "== file_info ==" in captured.out
+    # Sections that the custom analyzer didn't include must be absent.
+    assert "== exif ==" not in captured.out
+
+
 def test_main_only_flag_filters_results(capsys: pytest.CaptureFixture[str]) -> None:
     """In-process ``--only`` filter — covers the success branch of
     ``_filter_result`` invocation (the subprocess equivalent only exercises
@@ -200,32 +241,32 @@ def test_main_only_flag_filters_results(capsys: pytest.CaptureFixture[str]) -> N
     assert "== exif ==" not in captured.out
 
 
-def test_main_verbose_sets_debug_log_level(
-    fixture_jpeg: Path, caplog: pytest.LogCaptureFixture
+def test_main_verbose_passes_debug_level_to_basicconfig(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``--verbose`` configures logging at DEBUG level. Without verbose,
-    DEBUG records are suppressed; with it, they pass through."""
-    with caplog.at_level(logging.DEBUG):
-        # First run without --verbose: emit a DEBUG record after main() runs
-        # and verify the level was set to WARNING (suppresses the record).
-        # logging.basicConfig only takes effect on the first call per process,
-        # so we verify the level via the root logger's effective level instead
-        # of trying to test the suppression itself.
-        rc = main([str(fixture_jpeg)])
-        assert rc == 0
-        assert logging.getLogger().level <= logging.DEBUG  # caplog forced it
+    """``--verbose`` configures ``logging.basicConfig`` at DEBUG level;
+    without it, WARNING.
 
-    # Subsequent main([..., "--verbose"]) calls won't reconfigure due to
-    # basicConfig's once-only behavior, but main() not crashing on the
-    # flag is the contract we care about here.
-    rc = main([str(fixture_jpeg), "--verbose"])
+    Tested by monkeypatching ``logging.basicConfig`` to capture its
+    ``level`` kwarg. Sidesteps Python's once-per-process guard on
+    ``basicConfig`` (which makes the in-process repeated-call semantics
+    impossible to test honestly via log-record capture) and pins the
+    actual contract: the flag drives the level argument."""
+    captured: list[int] = []
+
+    def _capture(**kwargs: object) -> None:
+        level = kwargs.get("level")
+        assert isinstance(level, int)
+        captured.append(level)
+
+    monkeypatch.setattr(logging, "basicConfig", _capture)
+
+    rc = main([str(fixture_path("exif_rich.jpg"))])
+    assert rc == 0
+    rc = main([str(fixture_path("exif_rich.jpg")), "--verbose"])
     assert rc == 0
 
-
-@pytest.fixture
-def fixture_jpeg() -> Path:
-    """Convenience: a fixture path the in-process tests reuse."""
-    return fixture_path("exif_rich.jpg")
+    assert captured == [logging.WARNING, logging.DEBUG]
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +365,22 @@ def test_format_text_handles_unknown_payload_shape() -> None:
     result = _result_with(custom=ExtractorResult("custom", "raw string payload"))
     text = _format_text(result)
     assert "'raw string payload'" in text
+
+
+def test_format_text_handles_empty_dataclass_payload() -> None:
+    """Defensive: an empty dataclass (no fields) renders ``(empty)``,
+    symmetric with the empty-dict branch. ``FileInfo`` is never field-
+    less in practice; this exercises the branch for a hypothetical future
+    payload that might be."""
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class _Empty:
+        """Test-only zero-field dataclass."""
+
+    result = _result_with(custom=ExtractorResult("custom", _Empty()))
+    text = _format_text(result)
+    assert "(empty)" in text
 
 
 def test_format_json_round_trips_simple_payload() -> None:

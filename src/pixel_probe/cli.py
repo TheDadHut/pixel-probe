@@ -43,10 +43,16 @@ __all__ = ["main"]
 _KNOWN_EXTRACTORS: tuple[str, ...] = ("file_info", "exif", "iptc", "xmp")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, analyzer: Analyzer | None = None) -> int:
     """Run the CLI with the given argv (or ``sys.argv[1:]`` if ``None``).
 
     Returns the process exit code per the module docstring's contract.
+
+    The optional ``analyzer`` parameter exists for tests / advanced
+    callers that want to drive ``main`` with a custom extractor list
+    (e.g., to exercise a specific failure shape). Default is
+    :meth:`Analyzer.default`, which matches the documented user-facing
+    behavior of the ``pixel-probe`` script.
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -65,9 +71,13 @@ def main(argv: list[str] | None = None) -> int:
         # 1. analyze() catches MissingFileError and converts to error-in-result;
         #    a wall of "MissingFileError" entries from every extractor would
         #    bury the actual problem.
-        # 2. Standard CLI behavior: missing file → exit 1, single clear error
-        #    on stderr, nothing on stdout.
-        print(f"pixel-probe: error: {args.image}: No such file", file=sys.stderr)
+        # 2. Standard CLI behavior: bad path → exit 1, single clear error on
+        #    stderr, nothing on stdout.
+        # The message distinguishes "doesn't exist" from "exists but not a
+        # regular file" (directory, FIFO, socket, etc.) so the user knows
+        # whether to check spelling or path target shape.
+        reason = "no such file" if not path.exists() else "not a regular file"
+        print(f"pixel-probe: error: {args.image}: {reason}", file=sys.stderr)
         return 1
 
     if args.only is not None:
@@ -79,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         requested = None
 
-    result = Analyzer.default().analyze(path)
+    result = (analyzer or Analyzer.default()).analyze(path)
     if requested is not None:
         result = _filter_result(result, requested)
 
@@ -143,10 +153,19 @@ def _parse_only(only: str) -> tuple[str, ...]:
 
 def _filter_result(result: AnalysisResult, names: tuple[str, ...]) -> AnalysisResult:
     """Return a new :class:`AnalysisResult` containing only the requested
-    extractors. Names not present in ``result.results`` are silently
-    skipped — not an error, since validation against the *known* set
-    happened in :func:`_parse_only`; absence here means the caller didn't
-    wire that extractor into their analyzer."""
+    extractors.
+
+    **Order:** the filtered result preserves ``names`` order, *not* the
+    declared order from :meth:`Analyzer.default`. This is a deliberate
+    deviation from [ADR 0005](docs/adr/0005-sequential-extraction.md)'s
+    declared-order contract for the unfiltered case — when the user
+    explicitly says ``--only xmp,exif``, they're expressing a preference
+    that beats canonical ordering.
+
+    Names not present in ``result.results`` are silently skipped — not an
+    error, since validation against the *known* set happened in
+    :func:`_parse_only`; absence here means the caller didn't wire that
+    extractor into their analyzer."""
     filtered = {name: result.results[name] for name in names if name in result.results}
     return AnalysisResult(path=result.path, results=filtered)
 
@@ -157,11 +176,16 @@ def _format_json(result: AnalysisResult) -> str:
     ``asdict`` recurses into nested dataclasses (notably ``FileInfo``);
     tuples become arrays. ``ExtractorResult.data`` can be ``None`` (failure
     per ADR 0011), a dict, or a dataclass — all three serialize correctly.
-    ``default=str`` is a safety net for any non-JSON-native value that
-    slips through (e.g. a future ``Path`` payload), preventing a crash on
-    the way out.
+
+    ``default=repr`` is the safety net for any non-JSON-native value that
+    slips through (e.g. a future ``Path`` or ``bytes`` payload). ``repr``
+    over ``str`` is deliberate: ``str(b"foo")`` produces ``"b'foo'"``,
+    which is *almost* JSON-friendly but loses the type signal; ``repr``
+    keeps the same string but makes "this was an unexpected type" visible
+    to debuggers grepping the JSON output. Currently no extractor surfaces
+    such types; the fallback is forward-compatibility insurance.
     """
-    return json.dumps(asdict(result), indent=2, default=str)
+    return json.dumps(asdict(result), indent=2, default=repr)
 
 
 def _format_text(result: AnalysisResult) -> str:
@@ -193,9 +217,14 @@ def _format_section(name: str, entry: ExtractorResult[Any]) -> list[str]:
         lines.append("  (no data)")
     elif is_dataclass(data) and not isinstance(data, type):
         # FileInfo or future dataclass payload. asdict() normalizes to dict.
+        # Symmetric with the dict branch's (empty) placeholder — defensive
+        # for a future fieldless dataclass; FileInfo never empty in practice.
         as_dict = asdict(data)
-        for key, value in _flatten_dict(as_dict):
-            lines.append(f"  {key}: {value}")
+        if not as_dict:
+            lines.append("  (empty)")
+        else:
+            for key, value in _flatten_dict(as_dict):
+                lines.append(f"  {key}: {value}")
     elif isinstance(data, dict):
         if not data:
             lines.append("  (empty)")
